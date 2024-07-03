@@ -17,6 +17,21 @@ import logging
 import psutil
 import signal
 
+from contextlib import contextmanager
+
+class TimeoutException(Exception): pass
+
+@contextmanager
+def time_limit(seconds):
+    def signal_handler(signum, frame):
+        raise TimeoutException("Timed out!")
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
 
@@ -112,18 +127,6 @@ class VoiceIsolationTranslator:
             
             isolated_voices[speaker].append(audio_data[start_sample:end_sample])
 
-            # Limit the number of chunks kept in memory
-            if len(isolated_voices[speaker]) > 10:
-                concatenated_audio = np.concatenate(isolated_voices[speaker])
-                sf.write(f"{speaker}_isolated_{len(isolated_voices[speaker])}.wav", concatenated_audio, sr)
-                isolated_voices[speaker] = []
-
-        # Write any remaining chunks
-        for speaker, chunks in isolated_voices.items():
-            if chunks:
-                concatenated_audio = np.concatenate(chunks)
-                sf.write(f"{speaker}_isolated_final.wav", concatenated_audio, sr)
-
         return isolated_voices
 
     def transcribe_and_translate(self, isolated_voices):
@@ -135,7 +138,7 @@ class VoiceIsolationTranslator:
             full_text = ""
             
             # Process in smaller chunks
-            chunk_size = 5 * 16000  # 5 seconds at 16kHz
+            chunk_size = 3 * 16000  # 3 seconds at 16kHz
             try:
                 for i, chunk in enumerate(audio_chunks):
                     logging.info(f"Processing chunk {i+1}/{len(audio_chunks)} for {speaker}")
@@ -147,15 +150,17 @@ class VoiceIsolationTranslator:
                     
                     for sub_chunk in sub_chunks:
                         try:
-                            transcription = self.whisper_model.transcribe(sub_chunk)
-                            full_text += transcription["text"] + " "
+                            with time_limit(30):  # 30 seconds timeout
+                                transcription = self.whisper_model.transcribe(sub_chunk)
+                                full_text += transcription["text"] + " "
+                        except TimeoutException:
+                            logging.error(f"Transcription timed out for chunk of speaker {speaker}")
                         except Exception as e:
                             logging.error(f"Error transcribing chunk for {speaker}: {e}")
                         
                         # Force garbage collection after each sub-chunk
                         gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        torch.cuda.empty_cache() if torch.cuda.is_available() else None
                         self.log_memory_usage()
                 
                 translations = {}
@@ -179,8 +184,7 @@ class VoiceIsolationTranslator:
             
             # Force garbage collection after each speaker
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
             self.log_memory_usage()
 
         return results
