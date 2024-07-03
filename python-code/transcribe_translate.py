@@ -39,6 +39,9 @@ MAX_CHUNK_SIZE = 25 * 1024 * 1024  # 25 MB, just under OpenAI's 26 MB limit
 # Rate limiting
 rate_limit = AsyncLimiter(10, 60)  # 10 requests per minute
 
+# Queue for chunk processing
+chunk_queue = asyncio.Queue()
+
 class Conversation:
     def __init__(self):
         self.original_text = ""
@@ -214,7 +217,7 @@ async def process_chunk(audio_chunk, video_frame=None):
                 logger.info(f"Translated ({lang}): {translation}")
                 conversation.add_translation(lang, translation)
 
-async def capture_and_process_stream(stream_url):
+async def chunk_producer(stream_url):
     logger.info("Starting ffmpeg process to capture audio and video.")
     process = await asyncio.create_subprocess_exec(
         'ffmpeg', '-i', stream_url, 
@@ -247,7 +250,7 @@ async def capture_and_process_stream(stream_url):
                 else:
                     video_frame = None
                 
-                await process_chunk(audio_chunk, video_frame)
+                await chunk_queue.put((audio_chunk, video_frame))
                 audio_buffer = audio_buffer[CHUNK_SIZE:]
 
         except asyncio.CancelledError:
@@ -259,6 +262,26 @@ async def capture_and_process_stream(stream_url):
 
     process.terminate()
     await process.wait()
+    await chunk_queue.put(None)  # Signal that production is done
+
+async def chunk_consumer():
+    while True:
+        chunk_data = await chunk_queue.get()
+        if chunk_data is None:
+            break
+        audio_chunk, video_frame = chunk_data
+        await process_chunk(audio_chunk, video_frame)
+        chunk_queue.task_done()
+
+async def capture_and_process_stream(stream_url):
+    producer = asyncio.create_task(chunk_producer(stream_url))
+    consumers = [asyncio.create_task(chunk_consumer()) for _ in range(5)]  # Create 5 consumers
+    
+    await producer
+    await chunk_queue.join()
+    for consumer in consumers:
+        consumer.cancel()
+    await asyncio.gather(*consumers, return_exceptions=True)
 
 async def process_video_file(file_path):
     logger.info(f"Processing video file: {file_path}")
@@ -272,7 +295,7 @@ async def process_video_file(file_path):
     chunk_duration = 5000  # 5 seconds in milliseconds
     chunks = make_chunks(audio, chunk_duration)
 
-    for i, chunk in enumerate(chunks):
+    async def process_chunk_wrapper(i, chunk):
         start_time = i * chunk_duration / 1000
         end_time = min((i + 1) * chunk_duration / 1000, duration)
         
@@ -286,7 +309,16 @@ async def process_video_file(file_path):
         else:
             await process_chunk(chunk)
 
-async def main():
+    semaphore = asyncio.Semaphore(5)  # Limit concurrent processing to 5 chunks
+
+    async def semaphore_wrapper(i, chunk):
+        async with semaphore:
+            await process_chunk_wrapper(i, chunk)
+
+    tasks = [asyncio.create_task(semaphore_wrapper(i, chunk)) for i, chunk in enumerate(chunks)]
+    await asyncio.gather(*tasks)
+
+def main():
     print("Choose an option:")
     print("1. Process a livestream")
     print("2. Process a video file")
@@ -294,21 +326,21 @@ async def main():
 
     if choice == "1":
         stream_url = input("Enter the stream URL: ")
-        await capture_and_process_stream(stream_url)
+        asyncio.run(capture_and_process_stream(stream_url))
     elif choice == "2":
         file_path = input("Enter the path to the video file: ")
-        await process_video_file(file_path)
+        asyncio.run(process_video_file(file_path))
     else:
         print("Invalid choice. Please run the script again and choose 1 or 2.")
         return
 
     conversation.save_to_files()
 
-    summary = await summarize_text(conversation.original_text)
+    summary = asyncio.run(summarize_text(conversation.original_text))
     if summary:
         print(f"Summary: {summary}")
         with open(os.path.join(OUTPUT_DIR, "summary", "conversation_summary.txt"), "w") as f:
             f.write(summary)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
