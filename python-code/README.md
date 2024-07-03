@@ -9,7 +9,10 @@ This repository contains tools for voice isolation, transcription, and translati
 
 ## Requirements
 
-The project dependencies are listed in `requirements.txt`. To install them, run: 'pip install -r requirements.txt'
+The project dependencies for voice isolation are listed in `requirements.txt`. To install them, run: 'pip install -r requirements.txt'
+
+To use the transcription, translation and sentiment analysis tool, please create an anaconda environment using the following command: 'conda env create -f voice_analysis.yml'
+
 
 Note: This project requires Python 3.8 or higher.
 
