@@ -1,0 +1,10 @@
+numpy
+librosa
+soundfile
+pydub
+pyannote.audio
+openai-whisper
+googletrans==3.1.0a0
+torch
+python-dotenv
+tqdm
