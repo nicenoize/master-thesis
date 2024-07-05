@@ -23,6 +23,7 @@ import torch
 from scipy import stats
 import signal
 import sys
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,6 +34,7 @@ load_dotenv()
 
 # Initialize AsyncOpenAI client
 aclient = AsyncOpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+HF_TOKEN = os.getenv('HUGGINGFACE_TOKEN')
 
 # Initialize FER
 emotion_detector = FER(mtcnn=True)
@@ -260,8 +262,19 @@ async def translate_text(text, target_lang, use_local_model=False):
     try:
         if use_local_model:
             # Use local translation model
-            translator = pipeline("translation", model=f"Helsinki-NLP/opus-mt-en-{target_lang}")
-            translation = translator(text)[0]['translation_text']
+            model_name = "Helsinki-NLP/opus-mt-en-de"  # Changed from 'ger' to 'de'
+            
+            # Use the token if available
+            if HF_TOKEN:
+                tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=HF_TOKEN)
+                model = AutoModelForSeq2SeqLM.from_pretrained(model_name, use_auth_token=HF_TOKEN)
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+            
+            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            translated = model.generate(**inputs)
+            translation = tokenizer.decode(translated[0], skip_special_tokens=True)
         else:
             # Use OpenAI API
             response = await api_call_with_backoff(
