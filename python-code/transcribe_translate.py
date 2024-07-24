@@ -156,7 +156,8 @@ async def analyze_video_frame(frame):
     emotions = emotion_detector.detect_emotions(frame)
     return emotions[0]['emotions'] if emotions else None
 
-sentiment_analyzer = pipeline("sentiment-analysis")
+sentiment_analyzer = pipeline("sentiment-analysis", device="cuda" if torch.cuda.is_available() else "cpu")
+
 
 async def detailed_analysis(transcription, audio_features, video_emotions, use_local_models=False):
     logger.info("Performing detailed analysis.")
@@ -248,13 +249,17 @@ async def transcribe_audio(audio_chunk, use_local_model=False):
             with io.BytesIO() as audio_file:
                 audio_chunk.export(audio_file, format="mp3")
                 audio_file.seek(0)
-                response = await rateLimiter.api_call_with_backoff_whisper(
-                    aclient.audio.transcriptions.create,
-                    model="whisper-1",
-                    file=("audio.mp3", audio_file),
-                    response_format="text"
-                )
-            transcription = response
+                try:
+                    response = await rateLimiter.api_call_with_backoff_whisper(
+                        aclient.audio.transcriptions.create,
+                        model="whisper-1",
+                        file=("audio.mp3", audio_file),
+                        response_format="text"
+                    )
+                    transcription = response
+                except Exception as e:
+                    logger.error(f"Error during API transcription: {str(e)}")
+                    return None
 
         performance_logs["transcription"].setdefault(f"{'local' if use_local_model else 'api'}_{current_whisper_model}", []).append(time.time() - start_time)
         return transcription
@@ -342,27 +347,32 @@ async def summarize_text(text, use_local_models=False):
         logger.error(f"Error during summarization: {e}")
         return None
     
+# At the top of your file, add:
+api_semaphore = asyncio.Semaphore(5)  # Adjust this number based on your API limits
+
+# Modify the process_chunk function:
 async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
-    start_time = time.time()
-    transcribed_text = await transcribe_audio(audio_chunk, use_local_models)
-    if transcribed_text:
-        audio_features = await analyze_audio_features(audio_chunk)
-        video_emotions = await analyze_video_frame(video_frame) if video_frame is not None else None
-        detailed_analysis_result = await detailed_analysis(transcribed_text, audio_features, video_emotions, use_local_models)
-        logger.info(f"Detailed analysis: {detailed_analysis_result}")
-        conversation.add_text(detailed_analysis_result)
+    async with api_semaphore:
+        start_time = time.time()
+        transcribed_text = await transcribe_audio(audio_chunk, use_local_models)
+        if transcribed_text:
+            audio_features = await analyze_audio_features(audio_chunk)
+            video_emotions = await analyze_video_frame(video_frame) if video_frame is not None else None
+            detailed_analysis_result = await detailed_analysis(transcribed_text, audio_features, video_emotions, use_local_models)
+            logger.info(f"Detailed analysis: {detailed_analysis_result}")
+            conversation.add_text(detailed_analysis_result)
 
-        translation_tasks = [translate_text(detailed_analysis_result, lang, use_local_models) for lang in TARGET_LANGUAGES]
-        translations = await asyncio.gather(*translation_tasks)
+            translation_tasks = [translate_text(detailed_analysis_result, lang, use_local_models) for lang in TARGET_LANGUAGES]
+            translations = await asyncio.gather(*translation_tasks)
 
-        for lang, translation in zip(TARGET_LANGUAGES, translations):
-            if translation:
-                logger.info(f"Translated ({lang}): {translation}")
-                conversation.add_translation(lang, translation)
+            for lang, translation in zip(TARGET_LANGUAGES, translations):
+                if translation:
+                    logger.info(f"Translated ({lang}): {translation}")
+                    conversation.add_translation(lang, translation)
 
-    total_time = time.time() - start_time
-    performance_logs["total_processing"].setdefault(f"{'local' if use_local_models else 'api'}_{current_gpt_model}_{current_whisper_model}", []).append(total_time)
-    
+        total_time = time.time() - start_time
+        performance_logs["total_processing"].setdefault(f"{'local' if use_local_models else 'api'}_{current_gpt_model}_{current_whisper_model}", []).append(total_time)
+         
 async def chunk_producer(stream_url):
     logger.info("Starting ffmpeg process to capture audio and video.")
     process = await asyncio.create_subprocess_exec(
@@ -421,7 +431,7 @@ async def chunk_consumer(use_local_models):
 
 async def capture_and_process_stream(stream_url, use_local_models=False):
     producer = asyncio.create_task(chunk_producer(stream_url))
-    consumers = [asyncio.create_task(chunk_consumer(use_local_models)) for _ in range(5)]  # Create 5 consumers
+    consumers = [asyncio.create_task(chunk_consumer(use_local_models)) for _ in range(2)]  # Reduced from 5 to 3, can be increased later
     
     await producer
     await chunk_queue.join()
@@ -484,7 +494,7 @@ async def process_video_file(file_path, use_local_models=False):
             logger.warning(f"Could not read frame at time {(start_time + end_time) / 2:.2f} seconds")
             await process_chunk(chunk, use_local_models=use_local_models)
 
-    semaphore = asyncio.Semaphore(5)  # Limit concurrent processing to 5 chunks
+    semaphore = asyncio.Semaphore(3)  # Limit concurrent processed chunks
 
     async def semaphore_wrapper(i, chunk):
         async with semaphore:
