@@ -24,6 +24,7 @@ from scipy import stats
 import signal
 import sys
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import rateLimiter
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -94,8 +95,8 @@ performance_logs = {
 
 # Environment and model tracking
 current_environment = "M1 Max"
-current_gpt_model = "gpt-4"
-current_whisper_model = "base"
+current_gpt_model = "gpt-4o"
+current_whisper_model = "large"
 
 class Conversation:
     def __init__(self):
@@ -132,15 +133,15 @@ def num_tokens_from_string(string: str, model_name: str) -> int:
     stop=tenacity.stop_after_attempt(10),
     retry=tenacity.retry_if_exception_type((Exception, tenacity.TryAgain))
 )
-async def api_call_with_backoff(func, *args, **kwargs):
-    try:
-        async with rate_limit:
-            return await func(*args, **kwargs)
-    except Exception as e:
-        if "Too Many Requests" in str(e):
-            logger.warning("Rate limit exceeded. Retrying with exponential backoff.")
-            raise tenacity.TryAgain
-        raise
+# async def api_call_with_backoff(func, *args, **kwargs):
+#     try:
+#         async with rate_limit:
+#             return await func(*args, **kwargs)
+#     except Exception as e:
+#         if "Too Many Requests" in str(e):
+#             logger.warning("Rate limit exceeded. Retrying with exponential backoff.")
+#             raise tenacity.TryAgain
+#         raise
 
 async def analyze_audio_features(audio_chunk):
     audio_array = np.array(audio_chunk.get_array_of_samples())
@@ -191,7 +192,7 @@ async def detailed_analysis(transcription, audio_features, video_emotions, use_l
             Speaker X: [Sentence] (Sentiment: [sentiment], Intonation: [description], Vibe: [description])
             """
 
-            response = await api_call_with_backoff(
+            response = await rateLimiter.api_call_with_backoff(
                 aclient.chat.completions.create,
                 model=current_gpt_model,
                 messages=[
@@ -208,15 +209,19 @@ async def detailed_analysis(transcription, audio_features, video_emotions, use_l
         logger.error(f"Error during detailed analysis: {e}")
         performance_logs["analysis"].setdefault(f"{'local' if use_local_models else 'api'}_{current_gpt_model}", []).append(time.time() - start_time)
         return transcription
-    
+     
 async def transcribe_audio(audio_chunk, use_local_model=False):
-    logger.info("Starting transcription.")
+    logger.info(f"Starting transcription. Use local model: {use_local_model}")
     start_time = time.time()
     try:
         if use_local_model:
             # Use local Whisper model
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            model = WhisperForConditionalGeneration.from_pretrained(f"openai/whisper-{current_whisper_model}").to(device)
+            logger.info(f"Using device: {device}")
+            logger.info(f"Loading Whisper model: openai/whisper-{current_whisper_model}")
+            
+            model = WhisperForConditionalGeneration.from_pretrained(f"openai/whisper-{current_whisper_model}")
+            model.to(device)
             processor = WhisperProcessor.from_pretrained(f"openai/whisper-{current_whisper_model}")
             
             # Convert audio chunk to numpy array
@@ -227,20 +232,23 @@ async def transcribe_audio(audio_chunk, use_local_model=False):
             
             # Resample audio to 16kHz if necessary
             if audio_chunk.frame_rate != 16000:
+                logger.info(f"Resampling audio from {audio_chunk.frame_rate}Hz to 16000Hz")
                 audio_array = librosa.resample(audio_array, orig_sr=audio_chunk.frame_rate, target_sr=16000)
             
             # Process audio with the Whisper processor
             input_features = processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features.to(device)
             
             # Generate transcription
-            generated_ids = model.generate(input_features, language="en", task="transcribe")
+            logger.info("Generating transcription")
+            generated_ids = model.generate(input_features)
             transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            logger.info(f"Transcription result: {transcription[:100]}...")  # Log first 100 chars
         else:
             # Use OpenAI API
             with io.BytesIO() as audio_file:
                 audio_chunk.export(audio_file, format="mp3")
                 audio_file.seek(0)
-                response = await api_call_with_backoff(
+                response = await rateLimiter.api_call_with_backoff_whisper(
                     aclient.audio.transcriptions.create,
                     model="whisper-1",
                     file=("audio.mp3", audio_file),
@@ -277,7 +285,7 @@ async def translate_text(text, target_lang, use_local_model=False):
             translation = tokenizer.decode(translated[0], skip_special_tokens=True)
         else:
             # Use OpenAI API
-            response = await api_call_with_backoff(
+            response = await rateLimiter.api_call_with_backoff(
                 aclient.chat.completions.create,
                 model=current_gpt_model,
                 messages=[
@@ -294,40 +302,46 @@ async def translate_text(text, target_lang, use_local_model=False):
         performance_logs["translation"].setdefault(f"{'local' if use_local_model else 'api'}_{current_gpt_model}", []).append(time.time() - start_time)
         return None
 
-async def summarize_text(text):
+async def summarize_text(text, use_local_models=False):
     logger.info("Starting summarization.")
     try:
-        max_tokens = 4000
-        if num_tokens_from_string(text, current_gpt_model) > max_tokens:
-            chunks = [text[i:i+max_tokens] for i in range(0, len(text), max_tokens)]
-            summaries = []
-            for chunk in chunks:
-                response = await api_call_with_backoff(
+        if use_local_models:
+            # Use local summarization model
+            summary = summarizer(text, max_length=150, min_length=30, do_sample=False)[0]['summary_text']
+        else:
+            # Use OpenAI API
+            max_tokens = 4000
+            if num_tokens_from_string(text, current_gpt_model) > max_tokens:
+                chunks = [text[i:i+max_tokens] for i in range(0, len(text), max_tokens)]
+                summaries = []
+                for chunk in chunks:
+                    response = await rateLimiter.api_call_with_backoff(
+                        aclient.chat.completions.create,
+                        model=current_gpt_model,
+                        messages=[
+                            {"role": "system", "content": "Summarize the following text concisely."},
+                            {"role": "user", "content": chunk}
+                        ],
+                        max_tokens=500
+                    )
+                    summaries.append(response.choices[0].message.content.strip())
+                summary = " ".join(summaries)
+            else:
+                response = await rateLimiter.api_call_with_backoff(
                     aclient.chat.completions.create,
                     model=current_gpt_model,
                     messages=[
                         {"role": "system", "content": "Summarize the following text concisely."},
-                        {"role": "user", "content": chunk}
+                        {"role": "user", "content": text}
                     ],
                     max_tokens=500
                 )
-                summaries.append(response.choices[0].message.content.strip())
-            return " ".join(summaries)
-        else:
-            response = await api_call_with_backoff(
-                aclient.chat.completions.create,
-                model=current_gpt_model,
-                messages=[
-                    {"role": "system", "content": "Summarize the following text concisely."},
-                    {"role": "user", "content": text}
-                ],
-                max_tokens=500
-            )
-            return response.choices[0].message.content.strip()
+                summary = response.choices[0].message.content.strip()
+        return summary
     except Exception as e:
         logger.error(f"Error during summarization: {e}")
         return None
-
+    
 async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
     start_time = time.time()
     transcribed_text = await transcribe_audio(audio_chunk, use_local_models)
@@ -345,12 +359,10 @@ async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
             if translation:
                 logger.info(f"Translated ({lang}): {translation}")
                 conversation.add_translation(lang, translation)
-    else:
-        logger.warning("Transcription failed for this chunk. Skipping further processing.")
 
     total_time = time.time() - start_time
     performance_logs["total_processing"].setdefault(f"{'local' if use_local_models else 'api'}_{current_gpt_model}_{current_whisper_model}", []).append(total_time)
-
+    
 async def chunk_producer(stream_url):
     logger.info("Starting ffmpeg process to capture audio and video.")
     process = await asyncio.create_subprocess_exec(
@@ -596,6 +608,7 @@ def generate_performance_plots():
                 if data:
                     perform_anova(data, f"{metric}_{env}")
 
+
 async def run_experiment(input_source, use_local_models=False):
     global current_environment, current_gpt_model, current_whisper_model, experiment_completed
     
@@ -624,7 +637,7 @@ async def run_experiment(input_source, use_local_models=False):
         logger.info("All experiments completed. Saving final results...")
         save_current_state()
         
-        summary = await summarize_text(conversation.original_text)
+        summary = await summarize_text(conversation.original_text, use_local_models)
         if summary:
             print(f"Summary: {summary}")
             with open(os.path.join(OUTPUT_DIR, "summary", "conversation_summary.txt"), "w") as f:
@@ -634,6 +647,7 @@ async def run_experiment(input_source, use_local_models=False):
     except Exception as e:
         logger.error(f"Error during experiment: {e}")
         save_current_state()
+            
 def main():
     global current_environment
 
