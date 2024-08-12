@@ -200,35 +200,31 @@ current_whisper_model = "large"
 
 class Conversation:
     def __init__(self):
-        self.original_text = ""
-        self.detailed_text = ""
-        self.translations = {lang: "" for lang in TARGET_LANGUAGES}
+        self.transcriptions = {}
+        self.translations = {lang: {} for lang in TARGET_LANGUAGES}
 
-    def add_text(self, text):
-        self.original_text += text + "\n\n"
+    def add_transcription(self, model_key, text):
+        self.transcriptions.setdefault(model_key, []).append(text)
 
-    def add_detailed_text(self, text):
-        self.detailed_text += text + "\n\n"
-
-    def add_translation(self, lang, text):
-        self.translations[lang] += text + "\n\n"
+    def add_translation(self, model_key, lang, text):
+        self.translations[lang].setdefault(model_key, []).append(text)
 
     def save_to_files(self):
-        os.makedirs(os.path.join(OUTPUT_DIR, "transcription"), exist_ok=True)
-        os.makedirs(os.path.join(OUTPUT_DIR, "detailed_transcription"), exist_ok=True)
-        os.makedirs(os.path.join(OUTPUT_DIR, "summary"), exist_ok=True)
+        base_dir = os.path.join(OUTPUT_DIR, "transcriptions_and_translations")
+        os.makedirs(base_dir, exist_ok=True)
+
+        for model_key, texts in self.transcriptions.items():
+            file_path = os.path.join(base_dir, f"transcription_{model_key}.txt")
+            with open(file_path, "w") as f:
+                f.write("\n\n".join(texts))
+
         for lang in TARGET_LANGUAGES:
-            os.makedirs(os.path.join(OUTPUT_DIR, "translations", lang), exist_ok=True)
-
-        with open(os.path.join(OUTPUT_DIR, "transcription", "original_conversation.txt"), "w") as f:
-            f.write(self.original_text)
-
-        with open(os.path.join(OUTPUT_DIR, "detailed_transcription", "detailed_conversation.txt"), "w") as f:
-            f.write(self.detailed_text)
-
-        for lang, text in self.translations.items():
-            with open(os.path.join(OUTPUT_DIR, "translations", lang, f"translated_conversation_{lang}.txt"), "w") as f:
-                f.write(text)
+            lang_dir = os.path.join(base_dir, lang)
+            os.makedirs(lang_dir, exist_ok=True)
+            for model_key, texts in self.translations[lang].items():
+                file_path = os.path.join(lang_dir, f"translation_{model_key}.txt")
+                with open(file_path, "w") as f:
+                    f.write("\n\n".join(texts))
 
 conversation = Conversation()
 
@@ -472,9 +468,10 @@ async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
     
     async with api_semaphore:
         start_time = time.time()
+        model_key = f"{'local' if use_local_models else 'api'}_{current_gpt_model}_{current_whisper_model}"
         transcribed_text = await transcribe_audio(audio_chunk, use_local_models)
         if transcribed_text:
-            conversation.add_text(transcribed_text)
+            conversation.add_transcription(model_key, transcribed_text)
             
             audio_features = await analyze_audio_features(audio_chunk)
             speech_features = await extract_speech_features(audio_chunk)
@@ -497,14 +494,13 @@ async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
             
             if detailed_analysis_result:
                 logger.info(f"Detailed analysis: {detailed_analysis_result[:100]}...")  # Log first 100 chars
-                conversation.add_detailed_text(detailed_analysis_result)
 
                 # Add translation
                 for lang in TARGET_LANGUAGES:
                     translated_text = await translate_text(detailed_analysis_result, lang, use_local_models)
                     if translated_text:
                         logger.info(f"Translated to {lang}: {translated_text[:100]}...")  # Log first 100 chars
-                        conversation.add_translation(lang, translated_text)
+                        conversation.add_translation(model_key, lang, translated_text)
                     else:
                         logger.warning(f"Translation to {lang} failed")
             else:
@@ -513,15 +509,14 @@ async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
             logger.warning("Transcription failed for this chunk. Skipping further processing.")
 
         total_time = time.time() - start_time
-        key = f"{'local' if use_local_models else 'api'}_{current_gpt_model}_{current_whisper_model}"
-        performance_logs["total_processing"].setdefault(key, []).append(total_time)
-        performance_logs["transcription"].setdefault(key, []).append(time.time() - start_time)
+        performance_logs["total_processing"].setdefault(model_key, []).append(total_time)
+        performance_logs["transcription"].setdefault(model_key, []).append(time.time() - start_time)
         if detailed_analysis_result:
-            performance_logs["analysis"].setdefault(key, []).append(time.time() - start_time)
+            performance_logs["analysis"].setdefault(model_key, []).append(time.time() - start_time)
         if any(translated_text for lang in TARGET_LANGUAGES):
-            performance_logs["translation"].setdefault(key, []).append(time.time() - start_time)
+            performance_logs["translation"].setdefault(model_key, []).append(time.time() - start_time)
 
-        logger.debug(f"Added performance data for {key}")
+        logger.debug(f"Added performance data for {model_key}")
 
 async def chunk_producer(stream_url):
     logger.info("Starting ffmpeg process to capture audio and video.")
@@ -918,58 +913,92 @@ def generate_performance_plots():
             else:
                 logger.warning(f"Not enough data for ANOVA test for {metric} in {environment}")
 
-async def run_experiment(input_source, use_local_models=False):
+async def run_experiment(input_source, use_local_models=False, use_both=False):
     global current_environment, current_gpt_model, current_whisper_model, experiment_completed
     
-    gpt_models = ["gpt-4", "gpt-4-0613"]
+    gpt_models = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"]
     whisper_models = ["base", "small", "medium", "large"]
     
-    total_combinations = len(gpt_models) * len(whisper_models)
-    
+    total_combinations = len(gpt_models) * len(whisper_models) if not use_local_models else len(whisper_models)
+    if use_both:
+        total_combinations += len(whisper_models)
+
     with tqdm(total=total_combinations, desc="Experiment Progress") as pbar:
-        for gpt_model in gpt_models:
+        if use_both or not use_local_models:
+            for gpt_model in gpt_models:
+                for whisper_model in whisper_models:
+                    current_gpt_model = gpt_model
+                    current_whisper_model = whisper_model
+                    
+                    logger.info(f"Starting experiment with GPT model: {gpt_model}, Whisper model: {whisper_model}")
+                    
+                    try:
+                        if isinstance(input_source, str) and input_source.startswith("rtmp://"):
+                            await capture_and_process_stream(input_source, False)
+                        else:
+                            await process_video_file(input_source, False)
+                    except Exception as e:
+                        logger.error(f"Error during experiment with GPT model: {gpt_model}, Whisper model: {whisper_model}: {e}", exc_info=True)
+                        continue
+                    
+                    logger.info(f"Finished experiment with GPT model: {gpt_model}, Whisper model: {whisper_model}")
+                    
+                    # Debug logging and save intermediate results
+                    log_and_save_results(False)
+                    
+                    # Update progress bar
+                    pbar.update(1)
+        
+        if use_both or use_local_models:
             for whisper_model in whisper_models:
-                current_gpt_model = gpt_model
                 current_whisper_model = whisper_model
+                current_gpt_model = None
                 
-                logger.info(f"Starting experiment with GPT model: {gpt_model}, Whisper model: {whisper_model}")
+                logger.info(f"Starting experiment with local Whisper model: {whisper_model}")
                 
                 try:
                     if isinstance(input_source, str) and input_source.startswith("rtmp://"):
-                        await capture_and_process_stream(input_source, use_local_models)
+                        await capture_and_process_stream(input_source, True)
                     else:
-                        await process_video_file(input_source, use_local_models)
+                        await process_video_file(input_source, True)
                 except Exception as e:
-                    logger.error(f"Error during experiment with GPT model: {gpt_model}, Whisper model: {whisper_model}: {e}", exc_info=True)
-                    continue  # Continue with the next model combination
+                    logger.error(f"Error during experiment with local Whisper model: {whisper_model}: {e}", exc_info=True)
+                    continue
                 
-                logger.info(f"Finished experiment with GPT model: {gpt_model}, Whisper model: {whisper_model}")
+                logger.info(f"Finished experiment with local Whisper model: {whisper_model}")
                 
-                # Debug logging
-                for metric in ["transcription", "translation", "analysis", "total_processing"]:
-                    key = f"{'local' if use_local_models else 'api'}_{gpt_model}_{whisper_model}"
-                    if key in performance_logs[metric]:
-                        logger.info(f"Data points for {metric} with {key}: {len(performance_logs[metric][key])}")
-                    else:
-                        logger.warning(f"No data for {metric} with {key}")
-                
-                # Save intermediate results after each model combination
-                save_current_state()
+                # Debug logging and save intermediate results
+                log_and_save_results(True)
                 
                 # Update progress bar
                 pbar.update(1)
     
     try:
-        summary = await summarize_text(conversation.original_text, use_local_models)
-        if summary:
-            print(f"Summary: {summary}")
-            with open(os.path.join(OUTPUT_DIR, "summary", "conversation_summary.txt"), "w") as f:
-                f.write(summary)
+        for use_local in [True, False] if use_both else [use_local_models]:
+            model_key = f"{'local' if use_local else 'api'}_{current_gpt_model if not use_local else ''}_{current_whisper_model}"
+            summary = await summarize_text("\n\n".join(conversation.transcriptions[model_key]), use_local)
+            if summary:
+                print(f"Summary for {model_key}: {summary}")
+                with open(os.path.join(OUTPUT_DIR, "summary", f"conversation_summary_{model_key}.txt"), "w") as f:
+                    f.write(summary)
     except Exception as e:
         logger.error(f"Error during summarization: {e}")
     
     logger.info("Experiment run completed.")
     experiment_completed = True
+
+def log_and_save_results(use_local):
+    # Debug logging
+    for metric in ["transcription", "translation", "analysis", "total_processing"]:
+        key = f"{'local' if use_local else 'api'}_{current_gpt_model if not use_local else ''}_{current_whisper_model}"
+        if key in performance_logs[metric]:
+            logger.info(f"Data points for {metric} with {key}: {len(performance_logs[metric][key])}")
+        else:
+            logger.warning(f"No data for {metric} with {key}")
+    
+    # Save intermediate results
+    save_current_state()
+    conversation.save_to_files()
             
 def main():
     global current_environment
@@ -992,11 +1021,18 @@ def main():
     print("2. Process a video file")
     choice = input("Enter your choice (1 or 2): ")
 
-    use_local_models = input("Use local models? (y/n): ").lower() == 'y'
+    print("\nChoose experiment type:")
+    print("1. Use local models only")
+    print("2. Use API models only")
+    print("3. Run full experiment (both local and API models)")
+    exp_choice = input("Enter your choice (1-3): ")
+
+    use_local_models = exp_choice == "1"
+    use_both = exp_choice == "3"
 
     if choice == "1":
         stream_url = input("Enter the stream URL: ")
-        asyncio.run(run_experiment(stream_url, use_local_models))
+        asyncio.run(run_experiment(stream_url, use_local_models, use_both))
     elif choice == "2":
         while True:
             file_path = input("Enter the path to the video file: ")
@@ -1008,7 +1044,7 @@ def main():
             if retry.lower() != 'y':
                 print("Exiting the program.")
                 return
-        asyncio.run(run_experiment(file_path, use_local_models))
+        asyncio.run(run_experiment(file_path, use_local_models, use_both))
     else:
         print("Invalid choice. Please run the script again and choose 1 or 2.")
         return
