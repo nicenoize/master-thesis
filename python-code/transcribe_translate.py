@@ -6,6 +6,7 @@ import time
 from dotenv import load_dotenv
 from pydub import AudioSegment
 from pydub.utils import make_chunks
+from pydub.silence import detect_silence
 import cv2
 import numpy as np
 from fer import FER
@@ -25,6 +26,19 @@ import signal
 import sys
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import rateLimiter
+import parselmouth
+from parselmouth.praat import call
+from tqdm import tqdm
+
+
+
+device = (
+    "mps"
+    if torch.backends.mps.is_available()
+    else "cuda" if torch.cuda.is_available()
+    else "cpu"
+)
+print(f"Using device: {device}")
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -44,6 +58,92 @@ emotion_detector = FER(mtcnn=True)
 current_gpt_model = None
 current_whisper_model = None
 experiment_completed = False
+
+async def extract_speech_features(audio_chunk):
+
+    if len(audio_chunk) < 100:  # Skip chunks shorter than 100 ms
+        logger.warning(f"Skipping speech feature extraction for chunk with duration {len(audio_chunk)} ms (too short)")
+        return None
+    # Convert pydub AudioSegment to numpy array
+    audio_array = np.array(audio_chunk.get_array_of_samples()).astype(np.float32)
+    sample_rate = audio_chunk.frame_rate
+
+    # Detect pauses
+    silence_thresh = -30  # dB
+    min_silence_len = 100  # ms
+    silences = detect_silence(audio_chunk, min_silence_len=min_silence_len, silence_thresh=silence_thresh)
+    pauses = [{"start": start / 1000, "end": end / 1000} for start, end in silences]
+
+    # Extract pitch and intonation
+    sound = parselmouth.Sound(audio_array, sampling_frequency=sample_rate)
+    pitch = call(sound, "To Pitch", 0.0, 75, 600)
+    pitch_values = pitch.selected_array['frequency']
+    pitch_mean = np.mean(pitch_values[pitch_values != 0])
+    pitch_std = np.std(pitch_values[pitch_values != 0])
+
+    # Extract intensity (volume)
+    intensity = sound.to_intensity()
+    intensity_values = intensity.values[0]
+    intensity_mean = np.mean(intensity_values)
+    intensity_std = np.std(intensity_values)
+
+    # Estimate speech rate using zero-crossings
+    zero_crossings = np.sum(np.diff(np.sign(audio_array)) != 0)
+    duration = len(audio_array) / sample_rate
+    speech_rate = zero_crossings / (2 * duration)  # Rough estimate of syllables per second
+
+    # Extract formants for vowel analysis
+    formants = call(sound, "To Formant (burg)", 0.0, 5, 5500, 0.025, 50)
+    f1_mean = call(formants, "Get mean", 1, 0, 0, "hertz")
+    f2_mean = call(formants, "Get mean", 2, 0, 0, "hertz")
+
+    return {
+        "pauses": pauses,
+        "pitch": {"mean": pitch_mean, "std": pitch_std},
+        "intensity": {"mean": intensity_mean, "std": intensity_std},
+        "speech_rate": speech_rate,
+        "formants": {"F1": f1_mean, "F2": f2_mean}
+    }
+
+
+async def analyze_speech_characteristics(audio_features):
+    pitch = audio_features["pitch"]
+    intensity = audio_features["intensity"]
+    speech_rate = audio_features["speech_rate"]
+    
+    analysis = []
+    
+    # Analyze pitch
+    if pitch["mean"] > 150:
+        analysis.append("The speaker's voice is relatively high-pitched.")
+    elif pitch["mean"] < 100:
+        analysis.append("The speaker's voice is relatively low-pitched.")
+    
+    if pitch["std"] > 30:
+        analysis.append("There's significant pitch variation, indicating an expressive or emotional speaking style.")
+    elif pitch["std"] < 10:
+        analysis.append("The pitch is relatively monotone, suggesting a calm or reserved speaking style.")
+    
+    # Analyze intensity
+    if intensity["std"] > 10:
+        analysis.append("The speaker uses notable volume changes, possibly for emphasis.")
+    elif intensity["std"] < 5:
+        analysis.append("The speaker maintains a consistent volume throughout.")
+    
+    # Analyze speech rate
+    if speech_rate > 4:
+        analysis.append("The speaker is talking quite rapidly.")
+    elif speech_rate < 2:
+        analysis.append("The speaker is talking slowly and deliberately.")
+    
+    # Analyze pauses
+    if len(audio_features["pauses"]) > 5:
+        analysis.append("The speech contains frequent pauses, possibly for emphasis or thoughtful consideration.")
+    elif len(audio_features["pauses"]) < 2:
+        analysis.append("The speech flows continuously with few pauses.")
+    
+    return " ".join(analysis)
+
 
 def validate_file_path(file_path):
     if not file_path:
@@ -74,7 +174,7 @@ def save_current_state():
 if not os.getenv('OPENAI_API_KEY'):
     raise ValueError("No OpenAI API key found. Please set the OPENAI_API_KEY environment variable.")
 
-CHUNK_SIZE = 16000 * 5 * 2  # 5 seconds of audio at 16kHz, 16-bit
+CHUNK_SIZE = 16000 * 10 * 2  # 5 seconds of audio at 16kHz, 16-bit
 TARGET_LANGUAGES = ['ger']  # Only German for testing
 OUTPUT_DIR = "output"
 MAX_CHUNK_SIZE = 25 * 1024 * 1024  # 25 MB, just under OpenAI's 26 MB limit
@@ -95,28 +195,36 @@ performance_logs = {
 
 # Environment and model tracking
 current_environment = "M1 Max"
-current_gpt_model = "gpt-4o"
+current_gpt_model = "gpt-4"
 current_whisper_model = "large"
 
 class Conversation:
     def __init__(self):
         self.original_text = ""
+        self.detailed_text = ""
         self.translations = {lang: "" for lang in TARGET_LANGUAGES}
 
     def add_text(self, text):
         self.original_text += text + "\n\n"
+
+    def add_detailed_text(self, text):
+        self.detailed_text += text + "\n\n"
 
     def add_translation(self, lang, text):
         self.translations[lang] += text + "\n\n"
 
     def save_to_files(self):
         os.makedirs(os.path.join(OUTPUT_DIR, "transcription"), exist_ok=True)
+        os.makedirs(os.path.join(OUTPUT_DIR, "detailed_transcription"), exist_ok=True)
         os.makedirs(os.path.join(OUTPUT_DIR, "summary"), exist_ok=True)
         for lang in TARGET_LANGUAGES:
             os.makedirs(os.path.join(OUTPUT_DIR, "translations", lang), exist_ok=True)
 
         with open(os.path.join(OUTPUT_DIR, "transcription", "original_conversation.txt"), "w") as f:
             f.write(self.original_text)
+
+        with open(os.path.join(OUTPUT_DIR, "detailed_transcription", "detailed_conversation.txt"), "w") as f:
+            f.write(self.detailed_text)
 
         for lang, text in self.translations.items():
             with open(os.path.join(OUTPUT_DIR, "translations", lang, f"translated_conversation_{lang}.txt"), "w") as f:
@@ -133,15 +241,6 @@ def num_tokens_from_string(string: str, model_name: str) -> int:
     stop=tenacity.stop_after_attempt(10),
     retry=tenacity.retry_if_exception_type((Exception, tenacity.TryAgain))
 )
-# async def api_call_with_backoff(func, *args, **kwargs):
-#     try:
-#         async with rate_limit:
-#             return await func(*args, **kwargs)
-#     except Exception as e:
-#         if "Too Many Requests" in str(e):
-#             logger.warning("Rate limit exceeded. Retrying with exponential backoff.")
-#             raise tenacity.TryAgain
-#         raise
 
 async def analyze_audio_features(audio_chunk):
     audio_array = np.array(audio_chunk.get_array_of_samples())
@@ -158,8 +257,7 @@ async def analyze_video_frame(frame):
 
 sentiment_analyzer = pipeline("sentiment-analysis", device="cuda" if torch.cuda.is_available() else "cpu")
 
-
-async def detailed_analysis(transcription, audio_features, video_emotions, use_local_models=False):
+async def detailed_analysis(transcription, audio_features, speech_features, speech_analysis, video_emotions, use_local_models=False):
     logger.info("Performing detailed analysis.")
     start_time = time.time()
     try:
@@ -168,29 +266,33 @@ async def detailed_analysis(transcription, audio_features, video_emotions, use_l
             sentiment = sentiment_analyzer(transcription)[0]
             analysis_result = f"Transcription: {transcription}\n"
             analysis_result += f"Sentiment: {sentiment['label']} (score: {sentiment['score']:.2f})\n"
-            analysis_result += f"Audio Features: MFCCs and Chroma data available\n"
+            analysis_result += f"Audio Features: {audio_features}\n"
+            analysis_result += f"Speech Features: {speech_features}\n"
+            analysis_result += f"Speech Analysis: {speech_analysis}\n"
             analysis_result += f"Video Emotions: {video_emotions}\n"
         else:
             # Use OpenAI API
             analysis_prompt = f"""
-            Analyze the following transcription, taking into account the provided audio features and video emotions:
+            Analyze the following transcription, taking into account the provided audio features, speech characteristics, and video emotions:
 
-            Transcription: {transcription}
+            Tranqcription: {transcription}
 
-            Audio Features:
-            MFCCs: {audio_features['mfccs']}
-            Chroma: {audio_features['chroma']}
+            Audio Features: {audio_features}
+
+            Speech Features: {speech_features}
+
+            Speech Analysis: {speech_analysis}
 
             Video Emotions: {video_emotions}
 
             Based on this information:
             1. Identify the speakers.
-            2. Analyze the sentiment of each sentence.
-            3. Describe the intonation and overall vibe of each speaker's delivery.
+            2. Analyze the sentiment and emotion of each sentence.
+            3. Describe the speaking style, including intonation, emphasis, and overall delivery.
             4. Note any significant emotional changes or discrepancies between speech content and audio/visual cues.
 
             Format your response as:
-            Speaker X: [Sentence] (Sentiment: [sentiment], Intonation: [description], Vibe: [description])
+            Speaker X: [Sentence] (Sentiment: [sentiment], Emotion: [emotion], Speaking Style: [description])
             """
 
             response = await rateLimiter.api_call_with_backoff(
@@ -207,10 +309,11 @@ async def detailed_analysis(transcription, audio_features, video_emotions, use_l
         performance_logs["analysis"].setdefault(f"{'local' if use_local_models else 'api'}_{current_gpt_model}", []).append(time.time() - start_time)
         return analysis_result
     except Exception as e:
-        logger.error(f"Error during detailed analysis: {e}")
+        logger.error(f"Error during detailed analysis: {e}", exc_info=True)
         performance_logs["analysis"].setdefault(f"{'local' if use_local_models else 'api'}_{current_gpt_model}", []).append(time.time() - start_time)
         return transcription
-     
+
+
 async def transcribe_audio(audio_chunk, use_local_model=False):
     logger.info(f"Starting transcription. Use local model: {use_local_model}")
     start_time = time.time()
@@ -270,6 +373,10 @@ async def transcribe_audio(audio_chunk, use_local_model=False):
         return None
     
 async def translate_text(text, target_lang, use_local_model=False):
+    if not text:
+        logger.warning("Empty text provided for translation. Skipping.")
+        return None
+    
     logger.info(f"Starting translation to {target_lang}.")
     start_time = time.time()
     try:
@@ -303,18 +410,26 @@ async def translate_text(text, target_lang, use_local_model=False):
         performance_logs["translation"].setdefault(f"{'local' if use_local_model else 'api'}_{current_gpt_model}", []).append(time.time() - start_time)
         return translation
     except Exception as e:
-        logger.error(f"Error during translation to {target_lang}: {e}")
+        logger.error(f"Error during translation to {target_lang}: {e}", exc_info=True)
         performance_logs["translation"].setdefault(f"{'local' if use_local_model else 'api'}_{current_gpt_model}", []).append(time.time() - start_time)
         return None
+
+# Initialize the summarization pipeline
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
 
 async def summarize_text(text, use_local_models=False):
     logger.info("Starting summarization.")
     try:
         if use_local_models:
             # Use local summarization model
-            summary = summarizer(text, max_length=150, min_length=30, do_sample=False)[0]['summary_text']
+            chunks = [text[i:i+1024] for i in range(0, len(text), 1024)]  # BART models typically have a max length of 1024 tokens
+            summaries = []
+            for chunk in chunks:
+                summary = summarizer(chunk, max_length=150, min_length=30, do_sample=False)[0]['summary_text']
+                summaries.append(summary)
+            summary = " ".join(summaries)
         else:
-            # Use OpenAI API
+            # Use OpenAI API (existing code)
             max_tokens = 4000
             if num_tokens_from_string(text, current_gpt_model) > max_tokens:
                 chunks = [text[i:i+max_tokens] for i in range(0, len(text), max_tokens)]
@@ -350,29 +465,64 @@ async def summarize_text(text, use_local_models=False):
 # At the top of your file, add:
 api_semaphore = asyncio.Semaphore(5)  # Adjust this number based on your API limits
 
-# Modify the process_chunk function:
 async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
+    if len(audio_chunk) < 1000:
+        logger.warning(f"Skipping chunk with duration {len(audio_chunk)} ms (too short)")
+        return
+    
     async with api_semaphore:
         start_time = time.time()
         transcribed_text = await transcribe_audio(audio_chunk, use_local_models)
         if transcribed_text:
+            conversation.add_text(transcribed_text)
+            
             audio_features = await analyze_audio_features(audio_chunk)
+            speech_features = await extract_speech_features(audio_chunk)
+
+            if speech_features is None:
+                logger.warning("Skipping detailed analysis due to insufficient speech features")
+                return
+            
+            speech_analysis = await analyze_speech_characteristics(speech_features)
             video_emotions = await analyze_video_frame(video_frame) if video_frame is not None else None
-            detailed_analysis_result = await detailed_analysis(transcribed_text, audio_features, video_emotions, use_local_models)
-            logger.info(f"Detailed analysis: {detailed_analysis_result}")
-            conversation.add_text(detailed_analysis_result)
+            
+            detailed_analysis_result = await detailed_analysis(
+                transcribed_text, 
+                audio_features, 
+                speech_features,
+                speech_analysis,
+                video_emotions, 
+                use_local_models
+            )
+            
+            if detailed_analysis_result:
+                logger.info(f"Detailed analysis: {detailed_analysis_result[:100]}...")  # Log first 100 chars
+                conversation.add_detailed_text(detailed_analysis_result)
 
-            translation_tasks = [translate_text(detailed_analysis_result, lang, use_local_models) for lang in TARGET_LANGUAGES]
-            translations = await asyncio.gather(*translation_tasks)
-
-            for lang, translation in zip(TARGET_LANGUAGES, translations):
-                if translation:
-                    logger.info(f"Translated ({lang}): {translation}")
-                    conversation.add_translation(lang, translation)
+                # Add translation
+                for lang in TARGET_LANGUAGES:
+                    translated_text = await translate_text(detailed_analysis_result, lang, use_local_models)
+                    if translated_text:
+                        logger.info(f"Translated to {lang}: {translated_text[:100]}...")  # Log first 100 chars
+                        conversation.add_translation(lang, translated_text)
+                    else:
+                        logger.warning(f"Translation to {lang} failed")
+            else:
+                logger.warning("Detailed analysis failed")
+        else:
+            logger.warning("Transcription failed for this chunk. Skipping further processing.")
 
         total_time = time.time() - start_time
-        performance_logs["total_processing"].setdefault(f"{'local' if use_local_models else 'api'}_{current_gpt_model}_{current_whisper_model}", []).append(total_time)
-         
+        key = f"{'local' if use_local_models else 'api'}_{current_gpt_model}_{current_whisper_model}"
+        performance_logs["total_processing"].setdefault(key, []).append(total_time)
+        performance_logs["transcription"].setdefault(key, []).append(time.time() - start_time)
+        if detailed_analysis_result:
+            performance_logs["analysis"].setdefault(key, []).append(time.time() - start_time)
+        if any(translated_text for lang in TARGET_LANGUAGES):
+            performance_logs["translation"].setdefault(key, []).append(time.time() - start_time)
+
+        logger.debug(f"Added performance data for {key}")
+
 async def chunk_producer(stream_url):
     logger.info("Starting ffmpeg process to capture audio and video.")
     process = await asyncio.create_subprocess_exec(
@@ -439,6 +589,7 @@ async def capture_and_process_stream(stream_url, use_local_models=False):
         consumer.cancel()
     await asyncio.gather(*consumers, return_exceptions=True)
 
+
 async def process_video_file(file_path, use_local_models=False):
     logger.info(f"Processing video file: {file_path}")
     
@@ -472,12 +623,133 @@ async def process_video_file(file_path, use_local_models=False):
 
     try:
         audio = AudioSegment.from_file(file_path)
+    except FileNotFoundError:
+        logger.error(f"Audio file not found: {file_path}")
+        return
     except Exception as e:
         logger.error(f"Error reading audio from file: {e}")
         return
 
     chunk_duration = 5000  # 5 seconds in milliseconds
     chunks = make_chunks(audio, chunk_duration)
+
+    async def process_chunk_wrapper(i, chunk):
+        start_time = i * chunk_duration / 1000
+        end_time = min((i + 1) * chunk_duration / 1000, duration)
+        
+        video = cv2.VideoCapture(file_path)
+        video.set(cv2.CAP_PROP_POS_MSEC, (start_time + end_time) / 2 * 1000)
+        ret, frame = video.read()
+        video.release()
+
+        if ret:
+            await process_chunk(chunk, frame, use_local_models)
+        else:
+            logger.warning(f"Could not read frame at time {(start_time + end_time) / 2:.2f} seconds")
+            await process_chunk(chunk, use_local_models=use_local_models)
+
+    semaphore = asyncio.Semaphore(3)  # Limit concurrent processed chunks
+
+    async def semaphore_wrapper(i, chunk):
+        async with semaphore:
+            try:
+                await process_chunk_wrapper(i, chunk)
+            except Exception as e:
+                logger.error(f"Error processing chunk {i}: {e}")
+
+    tasks = [asyncio.create_task(semaphore_wrapper(i, chunk)) for i, chunk in enumerate(chunks)]
+    
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        logger.error(f"Error during video processing: {e}")
+    finally:
+        logger.info("Finished processing video file")
+
+        # Ensure all tasks are done
+        for task in tasks:
+            if not task.done():
+                logger.warning(f"Task {task} did not complete. Cancelling...")
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=1.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Task {task} could not be cancelled within timeout.")
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"Error while cancelling task {task}: {e}")
+
+    # Process any remaining data
+    try:
+        remaining_audio = audio[len(chunks) * chunk_duration:]
+        if len(remaining_audio) > 0:
+            logger.info("Processing remaining audio chunk")
+            await process_chunk(remaining_audio, use_local_models=use_local_models)
+    except Exception as e:
+        logger.error(f"Error processing remaining audio: {e}")
+
+    logger.info("Video processing completed")
+
+    async def process_chunk_wrapper(i, chunk):
+        start_time = i * chunk_duration / 1000
+        end_time = min((i + 1) * chunk_duration / 1000, duration)
+        
+        video = cv2.VideoCapture(file_path)
+        video.set(cv2.CAP_PROP_POS_MSEC, (start_time + end_time) / 2 * 1000)
+        ret, frame = video.read()
+        video.release()
+
+        if ret:
+            await process_chunk(chunk, frame, use_local_models)
+        else:
+            logger.warning(f"Could not read frame at time {(start_time + end_time) / 2:.2f} seconds")
+            await process_chunk(chunk, use_local_models=use_local_models)
+
+    semaphore = asyncio.Semaphore(3)  # Limit concurrent processed chunks
+
+    async def semaphore_wrapper(i, chunk):
+        async with semaphore:
+            try:
+                await process_chunk_wrapper(i, chunk)
+            except Exception as e:
+                logger.error(f"Error processing chunk {i}: {e}")
+
+    tasks = [asyncio.create_task(semaphore_wrapper(i, chunk)) for i, chunk in enumerate(chunks)]
+    
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        logger.error(f"Error during video processing: {e}")
+    finally:
+        logger.info("Finished processing video file")
+
+        # Ensure all tasks are done
+        for task in tasks:
+            if not task.done():
+                logger.warning(f"Task {task} did not complete. Cancelling...")
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=1.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Task {task} could not be cancelled within timeout.")
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"Error while cancelling task {task}: {e}")
+
+    # Process any remaining data
+    try:
+        remaining_audio = audio[len(chunks) * chunk_duration:]
+        if len(remaining_audio) > 0:
+            logger.info("Processing remaining audio chunk")
+            await process_chunk(remaining_audio, use_local_models=use_local_models)
+    except Exception as e:
+        logger.error(f"Error processing remaining audio: {e}")
+
+    logger.info("Video processing completed")
+
+
 
     async def process_chunk_wrapper(i, chunk):
         start_time = i * chunk_duration / 1000
@@ -509,15 +781,16 @@ async def process_video_file(file_path, use_local_models=False):
     finally:
         logger.info("Finished processing video file")
 
-    # Ensure all tasks are done
-    for task in tasks:
-        if not task.done():
-            logger.warning(f"Task {task} did not complete. Cancelling...")
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        # Ensure all tasks are done
+        for task in tasks:
+            if not task.done():
+                logger.warning(f"Task {task} did not complete. Cancelling...")
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
 def save_performance_logs():
     os.makedirs(os.path.join(OUTPUT_DIR, "performance_logs"), exist_ok=True)
     with open(os.path.join(OUTPUT_DIR, "performance_logs", f"{current_environment}_logs.json"), "w") as f:
@@ -531,53 +804,56 @@ def load_performance_logs(environment):
         return None
 
 def generate_performance_plots():
-    environments = ["M1 Max", "NVIDIA 4080", "Hetzner Cloud", "Vultr Cloud"]
+    environment = current_environment
     gpt_models = ["gpt-4", "gpt-4-0613"]
     whisper_models = ["base", "small", "medium", "large"]
 
-    # Load data for all environments
-    all_data = {env: load_performance_logs(env) for env in environments}
+    # Load data for the current environment
+    all_data = {environment: load_performance_logs(environment)}
 
     # Plotting functions
-    def plot_boxplot(data, metric, title, filename):
-        plt.figure(figsize=(12, 6))
+    def plot_boxplot(data, labels, metric, title, filename):
+        plt.figure(figsize=(15, 8))
         sns.boxplot(data=data)
-        plt.title(title)
-        plt.ylabel("Time (seconds)")
-        plt.xlabel("Configuration")
-        plt.xticks(rotation=45, ha='right')
+        plt.title(title, fontsize=16)
+        plt.ylabel("Time (seconds)", fontsize=12)
+        plt.xlabel("Model Configuration", fontsize=12)
+        plt.xticks(range(len(labels)), labels, rotation=45, ha='right', fontsize=10)
+        plt.legend(title="GPT Model - Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, "plots", filename), dpi=300, bbox_inches="tight")
         plt.close()
 
-    def plot_violin(data, metric, title, filename):
-        plt.figure(figsize=(12, 6))
+    def plot_violin(data, labels, metric, title, filename):
+        plt.figure(figsize=(15, 8))
         sns.violinplot(data=data)
-        plt.title(title)
-        plt.ylabel("Time (seconds)")
-        plt.xlabel("Configuration")
-        plt.xticks(rotation=45, ha='right')
+        plt.title(title, fontsize=16)
+        plt.ylabel("Time (seconds)", fontsize=12)
+        plt.xlabel("Model Configuration", fontsize=12)
+        plt.xticks(range(len(labels)), labels, rotation=45, ha='right', fontsize=10)
+        plt.legend(title="GPT Model - Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, "plots", filename), dpi=300, bbox_inches="tight")
         plt.close()
 
-    def plot_bar(data, metric, title, filename):
+    def plot_bar(data, labels, metric, title, filename):
         means = [np.mean(d) for d in data]
         std_devs = [np.std(d) for d in data]
         
-        plt.figure(figsize=(12, 6))
+        plt.figure(figsize=(15, 8))
         bars = plt.bar(range(len(data)), means, yerr=std_devs, capsize=5)
-        plt.title(title)
-        plt.ylabel("Mean Time (seconds)")
-        plt.xlabel("Configuration")
-        plt.xticks(range(len(data)), [f"Config {i+1}" for i in range(len(data))], rotation=45, ha='right')
+        plt.title(title, fontsize=16)
+        plt.ylabel("Mean Time (seconds)", fontsize=12)
+        plt.xlabel("Model Configuration", fontsize=12)
+        plt.xticks(range(len(labels)), labels, rotation=45, ha='right', fontsize=10)
         
         for i, bar in enumerate(bars):
             height = bar.get_height()
             plt.text(bar.get_x() + bar.get_width()/2., height,
                      f'{height:.2f}',
-                     ha='center', va='bottom')
+                     ha='center', va='bottom', fontsize=9)
         
+        plt.legend(title="GPT Model - Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, "plots", filename), dpi=300, bbox_inches="tight")
         plt.close()
@@ -587,37 +863,60 @@ def generate_performance_plots():
 
     # Generate plots for each metric
     for metric in ["transcription", "translation", "analysis", "total_processing"]:
-        for env in environments:
-            if all_data[env]:
-                data = []
-                labels = []
-                for gpt_model in gpt_models:
-                    for whisper_model in whisper_models:
-                        key = f"api_{gpt_model}_{whisper_model}"
-                        if key in all_data[env][metric]:
-                            data.append(all_data[env][metric][key])
-                            labels.append(f"{env}\n{gpt_model}\n{whisper_model}")
+        if all_data[environment] and metric in all_data[environment]:
+            data = []
+            labels = []
+            for gpt_model in gpt_models:
+                for whisper_model in whisper_models:
+                    key = f"api_{gpt_model}_{whisper_model}"
+                    if key in all_data[environment][metric]:
+                        data.append(all_data[environment][metric][key])
+                        labels.append(f"{gpt_model}\n{whisper_model}")
+            
+            if data:
+                title_base = f"{metric.capitalize()} Time - {environment}"
+                filename_base = f"{environment}_{metric}"
                 
-                if data:
-                    plot_boxplot(data, metric, f"{metric.capitalize()} Time Comparison - {env}", f"{env}_{metric}_boxplot.png")
-                    plot_violin(data, metric, f"{metric.capitalize()} Time Distribution - {env}", f"{env}_{metric}_violin.png")
-                    plot_bar(data, metric, f"Mean {metric.capitalize()} Time Comparison - {env}", f"{env}_{metric}_bar.png")
+                plot_boxplot(data, labels, metric, 
+                             f"{title_base} Comparison\nGPT Models: {', '.join(gpt_models)} | Whisper Models: {', '.join(whisper_models)}", 
+                             f"{filename_base}_boxplot.png")
+                plot_violin(data, labels, metric, 
+                            f"{title_base} Distribution\nGPT Models: {', '.join(gpt_models)} | Whisper Models: {', '.join(whisper_models)}", 
+                            f"{filename_base}_violin.png")
+                plot_bar(data, labels, metric, 
+                         f"Mean {title_base} Comparison\nGPT Models: {', '.join(gpt_models)} | Whisper Models: {', '.join(whisper_models)}", 
+                         f"{filename_base}_bar.png")
+            else:
+                logger.warning(f"No data available for plotting {metric} in {environment}")
 
     # Statistical analysis
     def perform_anova(data, metric):
-        f_statistic, p_value = stats.f_oneway(*data)
-        with open(os.path.join(OUTPUT_DIR, "plots", "statistical_analysis.txt"), "a") as f:
-            f.write(f"{metric.capitalize()} ANOVA Results:\n")
-            f.write(f"F-statistic: {f_statistic}\n")
-            f.write(f"p-value: {p_value}\n\n")
+        if len(data) < 2:
+            logger.warning(f"Not enough data for ANOVA test for {metric}. Skipping.")
+            return
+        
+        try:
+            # Ensure each sublist in data has at least one element
+            data = [sublist for sublist in data if len(sublist) > 0]
+            if len(data) < 2:
+                logger.warning(f"Not enough non-empty datasets for ANOVA test for {metric}. Skipping.")
+                return
+            
+            f_statistic, p_value = stats.f_oneway(*data)
+            with open(os.path.join(OUTPUT_DIR, "plots", f"{environment}_statistical_analysis.txt"), "a") as f:
+                f.write(f"{metric.capitalize()} ANOVA Results:\n")
+                f.write(f"F-statistic: {f_statistic}\n")
+                f.write(f"p-value: {p_value}\n\n")
+        except Exception as e:
+            logger.error(f"Error performing ANOVA for {metric}: {str(e)}")
 
     for metric in ["transcription", "translation", "analysis", "total_processing"]:
-        for env in environments:
-            if all_data[env]:
-                data = [all_data[env][metric][key] for key in all_data[env][metric] if key.startswith("api_")]
-                if data:
-                    perform_anova(data, f"{metric}_{env}")
-
+        if all_data[environment] and metric in all_data[environment]:
+            data = [all_data[environment][metric][key] for key in all_data[environment][metric] if key.startswith("api_")]
+            if len(data) >= 2:
+                perform_anova(data, f"{metric}_{environment}")
+            else:
+                logger.warning(f"Not enough data for ANOVA test for {metric} in {environment}")
 
 async def run_experiment(input_source, use_local_models=False):
     global current_environment, current_gpt_model, current_whisper_model, experiment_completed
@@ -625,7 +924,9 @@ async def run_experiment(input_source, use_local_models=False):
     gpt_models = ["gpt-4", "gpt-4-0613"]
     whisper_models = ["base", "small", "medium", "large"]
     
-    try:
+    total_combinations = len(gpt_models) * len(whisper_models)
+    
+    with tqdm(total=total_combinations, desc="Experiment Progress") as pbar:
         for gpt_model in gpt_models:
             for whisper_model in whisper_models:
                 current_gpt_model = gpt_model
@@ -633,30 +934,42 @@ async def run_experiment(input_source, use_local_models=False):
                 
                 logger.info(f"Starting experiment with GPT model: {gpt_model}, Whisper model: {whisper_model}")
                 
-                if isinstance(input_source, str) and input_source.startswith("rtmp://"):
-                    await capture_and_process_stream(input_source, use_local_models)
-                else:
-                    await process_video_file(input_source, use_local_models)
+                try:
+                    if isinstance(input_source, str) and input_source.startswith("rtmp://"):
+                        await capture_and_process_stream(input_source, use_local_models)
+                    else:
+                        await process_video_file(input_source, use_local_models)
+                except Exception as e:
+                    logger.error(f"Error during experiment with GPT model: {gpt_model}, Whisper model: {whisper_model}: {e}", exc_info=True)
+                    continue  # Continue with the next model combination
                 
                 logger.info(f"Finished experiment with GPT model: {gpt_model}, Whisper model: {whisper_model}")
                 
+                # Debug logging
+                for metric in ["transcription", "translation", "analysis", "total_processing"]:
+                    key = f"{'local' if use_local_models else 'api'}_{gpt_model}_{whisper_model}"
+                    if key in performance_logs[metric]:
+                        logger.info(f"Data points for {metric} with {key}: {len(performance_logs[metric][key])}")
+                    else:
+                        logger.warning(f"No data for {metric} with {key}")
+                
                 # Save intermediate results after each model combination
                 save_current_state()
-        
-        experiment_completed = True
-        logger.info("All experiments completed. Saving final results...")
-        save_current_state()
-        
+                
+                # Update progress bar
+                pbar.update(1)
+    
+    try:
         summary = await summarize_text(conversation.original_text, use_local_models)
         if summary:
             print(f"Summary: {summary}")
             with open(os.path.join(OUTPUT_DIR, "summary", "conversation_summary.txt"), "w") as f:
                 f.write(summary)
-        
-        logger.info("Experiment run completed.")
     except Exception as e:
-        logger.error(f"Error during experiment: {e}")
-        save_current_state()
+        logger.error(f"Error during summarization: {e}")
+    
+    logger.info("Experiment run completed.")
+    experiment_completed = True
             
 def main():
     global current_environment

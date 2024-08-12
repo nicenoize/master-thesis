@@ -19,6 +19,8 @@ import signal
 
 from contextlib import contextmanager
 
+OUTPUT_DIR = "output"
+
 class TimeoutException(Exception): pass
 
 @contextmanager
@@ -87,7 +89,7 @@ class VoiceIsolationTranslator:
     def load_diarization_pipeline(self, hf_token):
         try:
             self.log_memory_usage()
-            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization@2.1",
+            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization@2.1", # NOTE: Consider switching to pyannoteAI for better and faster options. (https://pyannote.ai/)
                                                 use_auth_token=hf_token).to(self.device)
             logging.info(f"Diarization pipeline loaded successfully on {self.device}")
             return pipeline
@@ -127,7 +129,18 @@ class VoiceIsolationTranslator:
             
             isolated_voices[speaker].append(audio_data[start_sample:end_sample])
 
-        return isolated_voices
+        # Create output directory if it doesn't exist
+        output_dir = os.path.join(os.path.dirname(self.video_path), "isolated_voices")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save isolated voices as separate audio files in the output directory
+        for speaker, audio_chunks in isolated_voices.items():
+            concatenated_audio = np.concatenate(audio_chunks)
+            output_filename = os.path.join(output_dir, f"{speaker}_isolated.wav")
+            sf.write(output_filename, concatenated_audio, sr)
+            logging.info(f"Saved isolated audio for {speaker} as {output_filename}")
+
+        return isolated_voices, output_dir
 
     def transcribe_and_translate(self, isolated_voices):
         logging.info("Transcribing and translating...")
@@ -195,8 +208,12 @@ class VoiceIsolationTranslator:
         try:
             audio_path = self.extract_audio()
             diarization = self.perform_diarization(audio_path)
-            isolated_voices = self.isolate_voices(audio_path, diarization)
+            isolated_voices, output_dir = self.isolate_voices(audio_path, diarization)
             results = self.transcribe_and_translate(isolated_voices)
+
+            # Add information about saved audio files to the results
+            for speaker in results:
+                results[speaker]["isolated_audio_file"] = os.path.join(output_dir, f"{speaker}_isolated.wav")
 
             end_time = time.time()
             logging.info(f"Total processing time: {end_time - start_time:.2f} seconds")
@@ -209,9 +226,6 @@ class VoiceIsolationTranslator:
             # Clean up temporary files
             if os.path.exists("temp_audio.wav"):
                 os.remove("temp_audio.wav")
-            for file in os.listdir():
-                if file.endswith("_isolated.wav"):
-                    os.remove(file)
 
 def signal_handler(signum, frame):
     logging.error("Received termination signal. Last known state:")
@@ -232,6 +246,7 @@ if __name__ == "__main__":
 
         for speaker, data in results.items():
             print(f"\nSpeaker: {speaker}")
+            print(f"Isolated audio file: {data['isolated_audio_file']}")
             print(f"Transcription: {data['transcription']}")
             for lang, translation in data['translations'].items():
                 print(f"Translation ({lang}): {translation}")
