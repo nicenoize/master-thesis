@@ -807,31 +807,37 @@ def generate_performance_plots():
     all_data = {environment: load_performance_logs(environment)}
 
     # Plotting functions
-    def plot_boxplot(data, labels, metric, title, filename):
+    def plot_boxplot(data, labels, metric, title, filename, is_local):
         plt.figure(figsize=(15, 8))
         sns.boxplot(data=data)
         plt.title(title, fontsize=16)
         plt.ylabel("Time (seconds)", fontsize=12)
         plt.xlabel("Model Configuration", fontsize=12)
         plt.xticks(range(len(labels)), labels, rotation=45, ha='right', fontsize=10)
-        plt.legend(title="GPT Model - Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
+        if is_local:
+            plt.legend(title="Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
+        else:
+            plt.legend(title="GPT Model - Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, "plots", filename), dpi=300, bbox_inches="tight")
         plt.close()
 
-    def plot_violin(data, labels, metric, title, filename):
+    def plot_violin(data, labels, metric, title, filename, is_local):
         plt.figure(figsize=(15, 8))
         sns.violinplot(data=data)
         plt.title(title, fontsize=16)
         plt.ylabel("Time (seconds)", fontsize=12)
         plt.xlabel("Model Configuration", fontsize=12)
         plt.xticks(range(len(labels)), labels, rotation=45, ha='right', fontsize=10)
-        plt.legend(title="GPT Model - Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
+        if is_local:
+            plt.legend(title="Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
+        else:
+            plt.legend(title="GPT Model - Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, "plots", filename), dpi=300, bbox_inches="tight")
         plt.close()
 
-    def plot_bar(data, labels, metric, title, filename):
+    def plot_bar(data, labels, metric, title, filename, is_local):
         means = [np.mean(d) for d in data]
         std_devs = [np.std(d) for d in data]
         
@@ -848,7 +854,10 @@ def generate_performance_plots():
                      f'{height:.2f}',
                      ha='center', va='bottom', fontsize=9)
         
-        plt.legend(title="GPT Model - Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
+        if is_local:
+            plt.legend(title="Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
+        else:
+            plt.legend(title="GPT Model - Whisper Model", title_fontsize=12, fontsize=10, loc='upper left', bbox_to_anchor=(1, 1))
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, "plots", filename), dpi=300, bbox_inches="tight")
         plt.close()
@@ -859,59 +868,72 @@ def generate_performance_plots():
     # Generate plots for each metric
     for metric in ["transcription", "translation", "analysis", "total_processing"]:
         if all_data[environment] and metric in all_data[environment]:
-            data = []
-            labels = []
-            for gpt_model in gpt_models:
-                for whisper_model in whisper_models:
-                    key = f"api_{gpt_model}_{whisper_model}"
-                    if key in all_data[environment][metric]:
-                        data.append(all_data[environment][metric][key])
-                        labels.append(f"{gpt_model}\n{whisper_model}")
-            
-            if data:
-                title_base = f"{metric.capitalize()} Time - {environment}"
-                filename_base = f"{environment}_{metric}"
+            for is_local in [True, False]:
+                data = []
+                labels = []
+                prefix = "local" if is_local else "api"
+                if is_local:
+                    for whisper_model in whisper_models:
+                        key = f"{prefix}_{whisper_model}"
+                        if key in all_data[environment][metric]:
+                            data.append(all_data[environment][metric][key])
+                            labels.append(f"{whisper_model}")
+                else:
+                    for gpt_model in gpt_models:
+                        for whisper_model in whisper_models:
+                            key = f"{prefix}_{gpt_model}_{whisper_model}"
+                            if key in all_data[environment][metric]:
+                                data.append(all_data[environment][metric][key])
+                                labels.append(f"{gpt_model}\n{whisper_model}")
                 
-                plot_boxplot(data, labels, metric, 
-                             f"{title_base} Comparison\nGPT Models: {', '.join(gpt_models)} | Whisper Models: {', '.join(whisper_models)}", 
-                             f"{filename_base}_boxplot.png")
-                plot_violin(data, labels, metric, 
-                            f"{title_base} Distribution\nGPT Models: {', '.join(gpt_models)} | Whisper Models: {', '.join(whisper_models)}", 
-                            f"{filename_base}_violin.png")
-                plot_bar(data, labels, metric, 
-                         f"Mean {title_base} Comparison\nGPT Models: {', '.join(gpt_models)} | Whisper Models: {', '.join(whisper_models)}", 
-                         f"{filename_base}_bar.png")
-            else:
-                logger.warning(f"No data available for plotting {metric} in {environment}")
+                if data:
+                    title_base = f"{metric.capitalize()} Time - {environment} ({'Local' if is_local else 'API'})"
+                    filename_base = f"{environment}_{metric}_{prefix}"
+                    
+                    model_info = f"Whisper Models: {', '.join(whisper_models)}" if is_local else f"GPT Models: {', '.join(gpt_models)} | Whisper Models: {', '.join(whisper_models)}"
+                    
+                    plot_boxplot(data, labels, metric, 
+                                 f"{title_base} Comparison\n{model_info}", 
+                                 f"{filename_base}_boxplot.png", is_local)
+                    plot_violin(data, labels, metric, 
+                                f"{title_base} Distribution\n{model_info}", 
+                                f"{filename_base}_violin.png", is_local)
+                    plot_bar(data, labels, metric, 
+                             f"Mean {title_base} Comparison\n{model_info}", 
+                             f"{filename_base}_bar.png", is_local)
+                else:
+                    logger.warning(f"No data available for plotting {metric} in {environment} ({'Local' if is_local else 'API'})")
 
     # Statistical analysis
-    def perform_anova(data, metric):
+    def perform_anova(data, metric, is_local):
         if len(data) < 2:
-            logger.warning(f"Not enough data for ANOVA test for {metric}. Skipping.")
+            logger.warning(f"Not enough data for ANOVA test for {metric} ({'Local' if is_local else 'API'}). Skipping.")
             return
         
         try:
             # Ensure each sublist in data has at least one element
             data = [sublist for sublist in data if len(sublist) > 0]
             if len(data) < 2:
-                logger.warning(f"Not enough non-empty datasets for ANOVA test for {metric}. Skipping.")
+                logger.warning(f"Not enough non-empty datasets for ANOVA test for {metric} ({'Local' if is_local else 'API'}). Skipping.")
                 return
             
             f_statistic, p_value = stats.f_oneway(*data)
             with open(os.path.join(OUTPUT_DIR, "plots", f"{environment}_statistical_analysis.txt"), "a") as f:
-                f.write(f"{metric.capitalize()} ANOVA Results:\n")
+                f.write(f"{metric.capitalize()} ANOVA Results ({'Local' if is_local else 'API'}):\n")
                 f.write(f"F-statistic: {f_statistic}\n")
                 f.write(f"p-value: {p_value}\n\n")
         except Exception as e:
-            logger.error(f"Error performing ANOVA for {metric}: {str(e)}")
+            logger.error(f"Error performing ANOVA for {metric} ({'Local' if is_local else 'API'}): {str(e)}")
 
     for metric in ["transcription", "translation", "analysis", "total_processing"]:
         if all_data[environment] and metric in all_data[environment]:
-            data = [all_data[environment][metric][key] for key in all_data[environment][metric] if key.startswith("api_")]
-            if len(data) >= 2:
-                perform_anova(data, f"{metric}_{environment}")
-            else:
-                logger.warning(f"Not enough data for ANOVA test for {metric} in {environment}")
+            for is_local in [True, False]:
+                prefix = "local" if is_local else "api"
+                data = [all_data[environment][metric][key] for key in all_data[environment][metric] if key.startswith(prefix)]
+                if len(data) >= 2:
+                    perform_anova(data, f"{metric}_{environment}", is_local)
+                else:
+                    logger.warning(f"Not enough data for ANOVA test for {metric} in {environment} ({'Local' if is_local else 'API'})")
 
 async def run_experiment(input_source, use_local_models=False, use_both=False):
     global current_environment, current_gpt_model, current_whisper_model, experiment_completed
