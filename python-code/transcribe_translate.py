@@ -3,10 +3,6 @@ import asyncio
 import logging
 import io
 import time
-from dotenv import load_dotenv
-from pydub import AudioSegment
-from pydub.utils import make_chunks
-from pydub.silence import detect_silence
 import cv2
 import csv
 import numpy as np
@@ -37,10 +33,18 @@ import json
 import re
 import soundfile as sf
 from moviepy.editor import VideoFileClip
+from pyannote.audio import Pipeline
+from jiwer import wer
+from pydub import AudioSegment
+from pydub.silence import detect_silence
+from dotenv import load_dotenv
+
 
 
 
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 device = (
     "mps"
@@ -64,10 +68,21 @@ HF_TOKEN = os.getenv('HUGGINGFACE_TOKEN')
 # Initialize FER
 emotion_detector = FER(mtcnn=True)
 
-# Global variables to track progress
+# Global variables
+current_environment = None
 current_gpt_model = None
 current_whisper_model = None
 experiment_completed = False
+
+# Performance logging
+performance_logs = {
+    "transcription": {},
+    "translation": {},
+    "analysis": {},
+    "speaker_diarization": {},
+    "sentiment_analysis": {},
+    "total_processing": {}
+}
 
 def initialize_transcription_pipeline(model_name="openai/whisper-large"):
     return pipeline("automatic-speech-recognition", model=model_name, device=device)
@@ -295,6 +310,23 @@ current_environment = "M1 Max"
 current_gpt_model = "gpt-4"
 current_whisper_model = "large"
 
+# Add this class for the ProgressHook
+class ProgressHook:
+    def __init__(self):
+        self.pbar = None
+
+    def __call__(self, step, total, prefix):
+        if self.pbar is None:
+            self.pbar = tqdm(total=total, desc=prefix)
+        self.pbar.update(1)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.pbar is not None:
+            self.pbar.close()
+
 class Conversation:
     def __init__(self):
         self.transcriptions = {}
@@ -324,6 +356,392 @@ class Conversation:
                     f.write("\n\n".join(texts))
 
 conversation = Conversation()
+# Cost estimation function
+
+# Update the estimate_cost function to handle different models
+def estimate_cost(model, duration):
+    costs = {
+        "whisper-1": 0.006 / 60,  # $0.006 per minute
+        "gpt-3.5-turbo": 0.002 / 1000,  # $0.002 per 1K tokens
+        "gpt-4": 0.03 / 1000,  # $0.03 per 1K tokens
+        "gpt-4-turbo": 0.03 / 1000,  # Assuming same cost as gpt-4
+    }
+    return costs.get(model, 0) * duration
+
+# Improved speaker diarization
+async def improved_diarize_transcription(audio_file_path, transcription):
+    logger.info("Performing improved speaker diarization")
+    try:
+        # Check if the file exists
+        if not os.path.exists(audio_file_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
+
+        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization@2.1",
+                                            use_auth_token=os.getenv('HUGGINGFACE_TOKEN'))
+        diarization = pipeline(audio_file_path)
+        
+        # Split transcription into sentences
+        sentences = transcription.split('. ')
+        
+        # Align diarization with transcription
+        diarized_transcription = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            turn_sentences = [s for s in sentences if turn.start <= sentences.index(s)/len(sentences)*turn.end < turn.end]
+            if turn_sentences:
+                diarized_transcription.extend([f"Speaker {speaker}: {s}" for s in turn_sentences])
+        
+        return '\n'.join(diarized_transcription)
+    
+    except Exception as e:
+        logger.error(f"Error during improved diarization: {e}")
+        logger.info("Returning original transcription without diarization")
+        return transcription
+
+
+# Local model caching
+model_cache = {}
+def get_local_model(model_name):
+    if model_name not in model_cache:
+        if "whisper" in model_name:
+            model_cache[model_name] = WhisperForConditionalGeneration.from_pretrained(f"openai/whisper-{model_name.split('-')[-1]}")
+        elif "sentiment" in model_name:
+            model_cache[model_name] = pipeline("sentiment-analysis", device=device)
+    return model_cache[model_name]
+
+# Livestream processing function
+async def process_livestream(stream_url, use_local_models, perform_additional_analysis):
+    logger.info(f"Processing livestream: {stream_url}")
+    try:
+        # Initialize models based on use_local_models flag
+        whisper_model = get_local_model("whisper-large") if use_local_models else "whisper-1"
+        gpt_model = "local" if use_local_models else current_gpt_model
+
+        # Start capturing and processing the stream
+        await capture_and_process_stream(stream_url, use_local_models)
+
+        # Perform additional analysis if requested
+        if perform_additional_analysis:
+            # Get the processed chunks from the conversation object
+            processed_chunks = conversation.transcriptions.get(f"{'local' if use_local_models else 'api'}_{gpt_model}_{whisper_model}", [])
+            
+            for chunk in processed_chunks:
+                sentiment_analysis = await analyze_sentiment_per_sentence(chunk, use_local_models)
+                logger.info(f"Sentiment analysis for chunk: {sentiment_analysis}")
+
+                # You might want to store these results or process them further
+
+        logger.info("Livestream processing completed")
+    except Exception as e:
+        logger.error(f"Error processing livestream: {e}")
+
+# Results comparison function
+def compare_results(results):
+    logger.info("Comparing results across models")
+    comparison = {}
+    for key, value in results.items():
+        whisper_model, gpt_model = key.split("_")
+        comparison[key] = {
+            "processing_time": value["processing_time"],
+            "estimated_cost": value.get("estimated_cost", 0),
+        }
+        if "transcriptions" in value and "ground_truth" in results:
+            comparison[key]["wer"] = wer(results["ground_truth"], value["transcriptions"])
+    
+    # Find the best model based on WER, processing time, and cost
+    best_model = min(comparison, key=lambda x: (
+        comparison[x].get("wer", float('inf')),
+        comparison[x]["processing_time"],
+        comparison[x]["estimated_cost"]
+    ))
+    
+    logger.info(f"Best performing model: {best_model}")
+    return comparison, best_model
+
+class Experiment:
+    def __init__(self, input_source, use_local_models, perform_additional_analysis):
+        self.input_source = input_source
+        self.use_local_models = use_local_models
+        self.perform_additional_analysis = perform_additional_analysis
+        self.results = {}
+
+    async def run(self):
+        global current_gpt_model, current_whisper_model, experiment_completed
+
+        whisper_models = ["tiny", "base", "small", "medium", "large"]
+        gpt_models = ["local"] if self.use_local_models else ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"]
+
+        for whisper_model in whisper_models:
+            current_whisper_model = whisper_model
+            for gpt_model in gpt_models:
+                current_gpt_model = gpt_model
+                
+                key = f"{whisper_model}_{gpt_model}"
+                result = await self.process_video(whisper_model, gpt_model)
+                self.results[key] = result
+
+                # Calculate cost based on the processing time
+                if gpt_model != "local":
+                    cost = estimate_cost(gpt_model, result["processing_time"])
+                else:
+                    cost = 0  # Assuming no cost for local models
+
+                self.results[key]["estimated_cost"] = cost
+
+        experiment_completed = True
+        compare_results(self.results)
+        self.save_results()
+        self.generate_performance_report()
+        self.generate_performance_plots()
+
+    async def process_video(self, whisper_model, gpt_model):
+        start_time = time.time()
+        
+        # Transcription
+        transcription = await self.transcribe_audio(whisper_model)
+        
+        # Speaker Diarization
+        diarized_transcription = await self.perform_speaker_diarization(transcription)
+        
+        # Translation
+        translations = await self.translate_text(diarized_transcription, gpt_model)
+        
+        # Sentiment Analysis
+        sentiment_analysis = await self.analyze_sentiment(diarized_transcription)
+        
+        # Video Emotion Analysis
+        video_emotions = await self.analyze_video_emotions()
+        
+        total_time = time.time() - start_time
+        
+        return {
+            "transcription": diarized_transcription,
+            "translations": translations,
+            "sentiment_analysis": sentiment_analysis,
+            "video_emotions": video_emotions,
+            "processing_time": total_time
+        }
+
+    async def transcribe_audio(self, whisper_model):
+        start_time = time.time()
+        logger.info(f"Starting transcription with Whisper model: {whisper_model}")
+        
+        try:
+            # Extract audio from video
+            video = VideoFileClip(self.input_source)
+            audio = video.audio
+            audio_file = self.input_source.rsplit('.', 1)[0] + '.wav'
+            audio.write_audiofile(audio_file, codec='pcm_s16le')
+            video.close()
+
+            # Resample audio to 16000 Hz
+            audio, sr = librosa.load(audio_file, sr=16000)
+            sf.write(audio_file, audio, sr, subtype='PCM_16')
+
+            if self.use_local_models:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                model = get_local_model(f"whisper-{whisper_model}")
+                processor = WhisperProcessor.from_pretrained(f"openai/whisper-{whisper_model}")
+                
+                input_features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features.to(device)
+                
+                with torch.no_grad():
+                    generated_ids = model.generate(input_features, task="transcribe")
+                transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            else:
+                # Use OpenAI API
+                with open(audio_file, "rb") as audio_file:
+                    response = await rateLimiter.api_call_with_backoff_whisper(
+                        aclient.audio.transcriptions.create,
+                        model="whisper-1",
+                        file=audio_file,
+                        response_format="text",
+                        language="en"
+                    )
+                    transcription = response
+
+            transcription_time = time.time() - start_time
+            performance_logs["transcription"][f"{'local' if self.use_local_models else 'api'}_{whisper_model}"] = transcription_time
+            return transcription
+        except Exception as e:
+            logger.error(f"Error during transcription: {str(e)}")
+            return None
+
+    async def perform_speaker_diarization(self, transcription):
+        audio_file = self.input_source.rsplit('.', 1)[0] + '.wav'
+        return await improved_diarize_transcription(audio_file, transcription)
+    async def translate_text(self, text, gpt_model):
+        start_time = time.time()
+        logger.info(f"Starting translation with model: {gpt_model}")
+        
+        translations = {}
+        try:
+            for lang in TARGET_LANGUAGES:
+                if self.use_local_models:
+                    # Use local translation model
+                    model_name = "Helsinki-NLP/opus-mt-en-de"  # Change this for other language pairs
+                    tokenizer = AutoTokenizer.from_pretrained(model_name)
+                    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+                    
+                    # Try to use MPS, fall back to CPU if not available
+                    try:
+                        model = model.to('mps')
+                    except RuntimeError:
+                        logger.warning("MPS device not available, falling back to CPU for translation")
+                        model = model.to('cpu')
+                    
+                    sentences = text.split('\n')
+                    translated_sentences = []
+                    for sentence in sentences:
+                        parts = sentence.split(': ', 1)
+                        if len(parts) == 2:
+                            speaker, content = parts
+                            inputs = tokenizer(content, return_tensors="pt", truncation=True, max_length=512).to(model.device)
+                            translated = model.generate(**inputs)
+                            translated_content = tokenizer.decode(translated[0], skip_special_tokens=True)
+                            translated_sentences.append(f"{speaker}: {translated_content}")
+                        else:
+                            translated_sentences.append(sentence)
+                    translation = '\n'.join(translated_sentences)
+                else:
+                    # Use OpenAI API
+                    response = await rateLimiter.api_call_with_backoff(
+                        aclient.chat.completions.create,
+                        model=gpt_model,
+                        messages=[
+                            {"role": "system", "content": f"Translate the following text to {lang}. Maintain the speaker labels and format 'Speaker X: [translated text]'."},
+                            {"role": "user", "content": text}
+                        ],
+                        max_tokens=1000
+                    )
+                    translation = response.choices[0].message.content.strip()
+                translations[lang] = translation
+
+            translation_time = time.time() - start_time
+            performance_logs["translation"][f"{'local' if self.use_local_models else 'api'}_{gpt_model}_{current_whisper_model}"] = translation_time
+            return translations
+        except Exception as e:
+            logger.error(f"Error during translation: {str(e)}")
+            return None
+
+    async def analyze_sentiment(self, text):
+        start_time = time.time()
+        logger.info("Performing sentiment analysis")
+        try:
+            if self.use_local_models:
+                # Initialize sentiment analyzer here to ensure it's always created
+                sentiment_analyzer = pipeline("sentiment-analysis", device=device)
+                sentiments = []
+                for line in text.split('\n'):
+                    parts = line.split(': ', 1)
+                    if len(parts) == 2:
+                        speaker, sentence = parts
+                        sentiment = sentiment_analyzer(sentence)[0]
+                        sentiments.append({
+                            "speaker": speaker,
+                            "sentence": sentence,
+                            "sentiment": {"label": sentiment["label"], "score": sentiment["score"]}
+                        })
+                sentiment_analysis = sentiments
+            else:
+                # Use OpenAI API for sentiment analysis
+                response = await rateLimiter.api_call_with_backoff(
+                    aclient.chat.completions.create,
+                    model=current_gpt_model,
+                    messages=[
+                        {"role": "system", "content": "Perform sentiment analysis on the following text. For each line, respond with a JSON object containing 'speaker', 'sentence', and 'sentiment' (with 'label' and 'score')."},
+                        {"role": "user", "content": text}
+                    ]
+                )
+                sentiment_analysis = json.loads(response.choices[0].message.content)
+            
+            sentiment_time = time.time() - start_time
+            performance_logs["sentiment_analysis"][f"{'local' if self.use_local_models else 'api'}_{current_gpt_model}_{current_whisper_model}"] = sentiment_time
+            return sentiment_analysis
+        except Exception as e:
+            logger.error(f"Error during sentiment analysis: {str(e)}")
+            return None
+
+    async def analyze_video_emotions(self):
+        logger.info("Performing video emotion analysis")
+        try:
+            video = cv2.VideoCapture(self.input_source)
+            fps = video.get(cv2.CAP_PROP_FPS)
+            frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = frame_count / fps
+
+            emotions = []
+            for i in range(0, frame_count, int(fps)):  # Analyze one frame per second
+                video.set(cv2.CAP_PROP_POS_FRAMES, i)
+                ret, frame = video.read()
+                if ret:
+                    emotion = emotion_detector.detect_emotions(frame)
+                    if emotion:
+                        emotions.append(emotion[0]['emotions'])
+
+            video.release()
+            return {
+                "duration": duration,
+                "emotions": emotions
+            }
+        except Exception as e:
+            logger.error(f"Error during video emotion analysis: {str(e)}")
+            return None
+
+    def save_results(self):
+        with open(f"results_{current_environment}.json", "w") as f:
+            json.dump(self.results, f, indent=2)
+
+    def generate_performance_report(results):
+        report_path = os.path.join(OUTPUT_DIR, "performance_report.csv")
+        with open(report_path, "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["GPT Model", "Whisper Model", "Processing Time (s)"])
+            if results and isinstance(results, dict):
+                for key, value in results.items():
+                    gpt_model, whisper_model = key.split("_")
+                    writer.writerow([gpt_model, whisper_model, value["processing_time"]])
+            else:
+                logger.warning("No results available for performance report")
+
+    def generate_performance_plots(self):
+        # Prepare data for plotting
+        models = list(self.results.keys())
+        processing_times = [result["processing_time"] for result in self.results.values()]
+
+        # Bar plot
+        plt.figure(figsize=(12, 6))
+        plt.bar(models, processing_times)
+        plt.title(f"Processing Time by Model Combination - {current_environment}")
+        plt.xlabel("Model Combination (Whisper_GPT)")
+        plt.ylabel("Processing Time (s)")
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, f"processing_time_bar_{current_environment}.png"))
+        plt.close()
+
+        # Box plot for each metric
+        metrics = ["transcription", "translation", "speaker_diarization", "sentiment_analysis"]
+        for metric in metrics:
+            data = []
+            labels = []
+            for key, times in performance_logs[metric].items():
+                if isinstance(times, list):
+                    data.extend(times)
+                    labels.extend([key] * len(times))
+                else:
+                    data.append(times)
+                    labels.append(key)
+
+            df = pd.DataFrame({"Model": labels, "Time": data})
+            plt.figure(figsize=(12, 6))
+            sns.boxplot(x="Model", y="Time", data=df)
+            plt.title(f"{metric.capitalize()} Time by Model - {current_environment}")
+            plt.xlabel("Model")
+            plt.ylabel("Time (s)")
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            plt.savefig(os.path.join(OUTPUT_DIR, f"{metric}_boxplot_{current_environment}.png"))
+            plt.close()
 
 def num_tokens_from_string(string: str, model_name: str) -> int:
     encoding = tiktoken.encoding_for_model(model_name)
@@ -1257,27 +1675,26 @@ def log_and_save_results(use_local):
     save_current_state()
     conversation.save_to_files()
             
-def main():
+async def main():
     global current_environment
 
-    # Set up signal handler
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    print("Choose an environment:")
-    print("1. M1 Max")
-    print("2. NVIDIA 4080")
-    print("3. Hetzner Cloud")
-    print("4. Vultr Cloud")
-    env_choice = input("Enter your choice (1-4): ")
-    
-    environments = ["M1 Max", "NVIDIA 4080", "Hetzner Cloud", "Vultr Cloud"]
-    current_environment = environments[int(env_choice) - 1]
-    
-    print("\nChoose an input source:")
-    print("1. Process a livestream")
-    print("2. Process a video file")
-    choice = input("Enter your choice (1 or 2): ")
+    load_dotenv()
 
+    # Environment selection
+    environments = ["M1 Max", "NVIDIA 4070", "Vultr Cloud", "Hetzner Cloud"]
+    print("Choose an environment:")
+    for i, env in enumerate(environments, 1):
+        print(f"{i}. {env}")
+    env_choice = int(input("Enter your choice (1-4): ")) - 1
+    current_environment = environments[env_choice]
+
+    # Input source selection
+    print("\nChoose an input source:")
+    print("1. Process a video file")
+    print("2. Process a livestream")
+    source_choice = input("Enter your choice (1 or 2): ")
+
+    # Experiment type selection
     print("\nChoose experiment type:")
     print("1. Use local models only")
     print("2. Use API models only")
@@ -1287,36 +1704,36 @@ def main():
     use_local_models = exp_choice in ["1", "3"]
     use_api_models = exp_choice in ["2", "3"]
 
-    print("\nPerform additional analysis (sentiment, video)?")
-    perform_additional_analysis = input("Enter your choice (y/n): ").lower() == 'y'
+    # Additional analysis option
+    perform_additional_analysis = input("\nPerform additional analysis (sentiment, video)? (y/n): ").lower() == 'y'
 
-    if choice == "1":
-        stream_url = input("Enter the stream URL: ")
-        if use_local_models:
-            asyncio.run(run_experiment(stream_url, True, perform_additional_analysis))
-        if use_api_models:
-            asyncio.run(run_experiment(stream_url, False, perform_additional_analysis))
-    elif choice == "2":
-        while True:
-            file_path = input("Enter the path to the video file: ")
-            is_valid, error_message = validate_file_path(file_path)
-            if is_valid:
-                break
-            print(f"Error: {error_message}")
-            retry = input("Do you want to try again? (y/n): ")
-            if retry.lower() != 'y':
-                print("Exiting the program.")
-                return
-        if use_local_models:
-            asyncio.run(run_experiment(file_path, True, perform_additional_analysis))
-        if use_api_models:
-            asyncio.run(run_experiment(file_path, False, perform_additional_analysis))
-    else:
-        print("Invalid choice. Please run the script again and choose 1 or 2.")
-        return
+    try:
+            if source_choice == "1":
+                input_source = input("Enter the path to the video file: ")
+                if use_local_models:
+                    experiment = Experiment(input_source, True, perform_additional_analysis)
+                    await experiment.run()
+                if use_api_models:
+                    experiment = Experiment(input_source, False, perform_additional_analysis)
+                    await experiment.run()
+            else:
+                stream_url = input("Enter the livestream URL: ")
+                if use_local_models:
+                    await process_livestream(stream_url, True, perform_additional_analysis)
+                if use_api_models:
+                    await process_livestream(stream_url, False, perform_additional_analysis)
 
-    if experiment_completed:
-        generate_performance_plots()
+            # Generate final reports and plots only if there are results
+            if 'experiment' in locals() and experiment.results:
+                generate_performance_report(experiment.results)
+                generate_performance_plots()
+            else:
+                logger.warning("No results available for report generation")
+
+    except Exception as e:
+        logger.error(f"An error occurred during the experiment: {e}", exc_info=True)
+    finally:
+        logger.info("Experiment completed")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
