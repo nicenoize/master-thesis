@@ -19,6 +19,7 @@ from moviepy.editor import VideoFileClip
 import gc
 import multiprocessing
 import subprocess
+import psutil  # For system resource optimization
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ warnings.filterwarnings("ignore", message="PySoundFile failed. Trying audioread 
 warnings.filterwarnings("ignore", message="librosa.core.audio.__audioread_load")
 
 class Experiment:
-    def __init__(self, config, input_source, use_local_models, model_choice, perform_additional_analysis, environment, performance_logger, api_choice=None):
+    def __init__(self, config, input_source, use_local_models, model_choice, perform_additional_analysis, environment, performance_logger, api_choice=None, use_diarization=True):
         self.config = config
         self.input_source = input_source
         self.use_local_models = use_local_models
@@ -36,11 +37,14 @@ class Experiment:
         self.environment = environment
         self.performance_logger = performance_logger
         self.api_choice = api_choice
+        self.use_diarization = use_diarization
         self.results = {}
         
         self.audio_processor = AudioProcessor(self.config, self.api_choice)
         self.video_processor = VideoProcessor()
         self.text_processor = TextProcessor(self.config)
+
+        self.available_cores = psutil.cpu_count(logical=False)  # Get available physical cores
 
     def extract_audio_from_video(self, video_path):
         # Extract audio from video
@@ -52,125 +56,135 @@ class Experiment:
         gc.collect()  # Force garbage collection
         return audio_path
 
-async def run(self):
-    whisper_models = self.config.WHISPER_MODELS if self.use_local_models else [self.config.OPENAI_WHISPER_MODEL]
-    gpt_models = ["local"] if self.use_local_models else self.config.GPT_MODELS
-    original_bitrate = self.get_audio_bitrate(self.input_source)
-    bitrates = [original_bitrate, 8000, 4000]  # Define bitrates lower than the original
+    async def run(self):
+        whisper_models = self.config.WHISPER_MODELS if self.use_local_models else [self.config.OPENAI_WHISPER_MODEL]
+        gpt_models = ["local"] if self.use_local_models else self.config.GPT_MODELS
+        original_bitrate = self.get_audio_bitrate(self.input_source)
+        bitrates = [original_bitrate, 8000, 4000]  # Define bitrates lower than the original
 
-    results = []
-    for bitrate in bitrates:
-        if bitrate <= original_bitrate:
-            audio_path = self.convert_audio_bitrate(self.input_source, bitrate)
-            for whisper_model in whisper_models:
-                for gpt_model in gpt_models:
-                    # Process each model and bitrate sequentially
-                    result = await self.process_video(whisper_model, gpt_model, audio_path, bitrate)
-                    if result is not None:
-                        self.results[f"{whisper_model}_{gpt_model}_{bitrate}"] = result
-                        results.append(result)
-            
-            # Clean up the converted audio file to save space
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-    
-    self.save_results()
-    self.generate_performance_report()
-    generate_plots(self.results, self.environment, self.use_local_models)
-    self.perform_cross_model_analysis()
+        results = []
+        for bitrate in bitrates:
+            if bitrate <= original_bitrate:
+                audio_path = self.convert_audio_bitrate(self.input_source, bitrate)
+                for whisper_model in whisper_models:
+                    for gpt_model in gpt_models:
+                        # Process each model and bitrate sequentially
+                        result = await self.process_video(whisper_model, gpt_model, audio_path, bitrate)
+                        if result is not None:
+                            self.results[f"{whisper_model}_{gpt_model}_{bitrate}"] = result
+                            results.append(result)
+                
+                # Clean up the converted audio file to save space
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+        
+        self.save_results()
+        self.generate_performance_report()
+        generate_plots(self.results, self.environment, self.use_local_models)
+        self.perform_cross_model_analysis()
 
-    return self.results
+        return self.results
 
-def get_audio_bitrate(self, video_path):
-    # Use ffprobe or similar tool to get the original bitrate of the audio
-    result = subprocess.run([
-        "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", 
-        "stream=bit_rate", "-of", "default=noprint_wrappers=1:nokey=1", video_path
-    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    bitrate = int(result.stdout.decode('utf-8').strip())
-    return bitrate
+    def get_audio_bitrate(self, video_path):
+        # Use ffprobe or similar tool to get the original bitrate of the audio
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", 
+            "stream=bit_rate", "-of", "default=noprint_wrappers=1:nokey=1", video_path
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        bitrate = int(result.stdout.decode('utf-8').strip())
+        return bitrate
 
-def convert_audio_bitrate(self, video_path, bitrate):
-    # Convert the audio from the video to the specified lower bitrate
-    audio_path = video_path.rsplit('.', 1)[0] + f'_{bitrate}.wav'
-    subprocess.run([
-        "ffmpeg", "-i", video_path, "-b:a", str(bitrate), "-ar", "16000", "-ac", "1", audio_path,
-        "-y",  # Overwrite without asking
-    ], check=True)
-    return audio_path
+    def convert_audio_bitrate(self, video_path, bitrate):
+        # Convert the audio from the video to the specified lower bitrate
+        audio_path = video_path.rsplit('.', 1)[0] + f'_{bitrate}.wav'
+        if not os.path.exists(audio_path):  # Avoid redundant conversion
+            subprocess.run([
+                "ffmpeg", "-i", video_path, "-b:a", str(bitrate), "-ar", "16000", "-ac", "1", audio_path,
+                "-y",  # Overwrite without asking
+            ], check=True)
+        return audio_path
 
-async def process_video(self, whisper_model, gpt_model, audio_path, bitrate):
-    output_structure = get_output_structure(
-        self.config,
-        self.environment, 
-        "local" if self.use_local_models else "api",
-        whisper_model,
-        gpt_model,
-        bitrate
-    )
-    
-    with self.performance_logger.measure_time(f"total_{whisper_model}_{gpt_model}_{bitrate}"):
-        try:
-            # Attempt to read the audio file
+    async def process_video(self, whisper_model, gpt_model, audio_path, bitrate):
+        output_structure = get_output_structure(
+            self.config,
+            self.environment, 
+            "local" if self.use_local_models else "api",
+            whisper_model,
+            gpt_model,
+            bitrate
+        )
+        
+        with self.performance_logger.measure_time(f"total_{whisper_model}_{gpt_model}_{bitrate}"):
             try:
-                audio, sampling_rate = sf.read(audio_path)
-                audio = audio.astype(np.float32)
-            except Exception as sf_error:
-                logger.warning(f"SoundFile failed to read the audio: {sf_error}. Trying with librosa.")
+                # Attempt to read the audio file
                 try:
-                    audio, sampling_rate = librosa.load(audio_path, sr=None)
-                except Exception as librosa_error:
-                    logger.error(f"Librosa failed to read the audio: {librosa_error}")
-                    return None
+                    audio, sampling_rate = sf.read(audio_path)
+                    audio = audio.astype(np.float32)
+                except Exception as sf_error:
+                    logger.warning(f"SoundFile failed to read the audio: {sf_error}. Trying with librosa.")
+                    try:
+                        audio, sampling_rate = librosa.load(audio_path, sr=None)
+                    except Exception as librosa_error:
+                        logger.error(f"Librosa failed to read the audio: {librosa_error}")
+                        return None
 
-            transcription = []
-            chunk_size = 16000 * 2  # 2-second chunks at 16kHz
-            for i in range(0, len(audio), chunk_size):
-                audio_chunk = audio[i:i + chunk_size]
-                with self.performance_logger.measure_time(f"transcription_{whisper_model}_{bitrate}"):
-                    if self.use_local_models:
-                        try:
-                            whisper = WhisperModel(whisper_model)
-                            transcription_chunk = await whisper.transcribe(audio_chunk, language='en')
-                        except Exception as e:
-                            logger.error(f"Error during Whisper model transcription: {e}")
-                            continue
-                    else:
-                        transcription_chunk = await self.audio_processor.api_transcribe(audio_chunk)
-                    
-                    transcription.append(transcription_chunk)
+                transcription = []
+                chunk_size = self.get_dynamic_chunk_size(len(audio))  # Adjust chunk size based on available memory
+                whisper = WhisperModel(whisper_model) if self.use_local_models else None
 
-            transcription = " ".join(transcription)
+                for i in range(0, len(audio), chunk_size):
+                    audio_chunk = audio[i:i + chunk_size]
+                    with self.performance_logger.measure_time(f"transcription_{whisper_model}_{bitrate}"):
+                        if self.use_local_models:
+                            try:
+                                if self.use_diarization:
+                                    transcription_chunk = await whisper.transcribe_and_diarize(audio_chunk, sampling_rate, language='en')
+                                else:
+                                    transcription_chunk = await whisper.transcribe(audio_chunk, sampling_rate, language='en')
+                            except Exception as e:
+                                logger.error(f"Error during Whisper model transcription: {e}")
+                                continue
+                        else:
+                            transcription_chunk = await self.audio_processor.api_transcribe(audio_chunk)
+                        
+                        transcription.append(transcription_chunk)
 
-            with self.performance_logger.measure_time(f"translation_{gpt_model}_{bitrate}"):
-                translations = await self.text_processor.translate(transcription, self.use_local_models)
-            
-            results = {
-                "whisper_model": whisper_model,
-                "gpt_model": gpt_model,
-                "bitrate": bitrate,
-                "transcription": transcription,
-                "translations": translations,
-            }
+                transcription = " ".join(transcription)
 
-            # Clear variables and force garbage collection
-            transcription = None
-            translations = None
-            audio = None
-            gc.collect()
+                with self.performance_logger.measure_time(f"translation_{gpt_model}_{bitrate}"):
+                    translations = await self.text_processor.translate(transcription, self.use_local_models)
+                
+                results = {
+                    "whisper_model": whisper_model,
+                    "gpt_model": gpt_model,
+                    "bitrate": bitrate,
+                    "transcription": transcription,
+                    "translations": translations,
+                }
 
-            self.save_experiment_results(results, output_structure)
+                # Clear variables and force garbage collection
+                transcription = None
+                translations = None
+                audio = None
+                gc.collect()
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error during audio conversion: {e}")
-            return None
+                self.save_experiment_results(results, output_structure)
 
-        except Exception as e:
-            logger.error(f"An error occurred during video processing: {e}")
-            return None
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Error during audio conversion: {e}")
+                return None
 
-    return results
+            except Exception as e:
+                logger.error(f"An error occurred during video processing: {e}")
+                return None
 
+        return results
+
+    def get_dynamic_chunk_size(self, total_length):
+        available_memory = psutil.virtual_memory().available
+        # Estimate chunk size based on available memory and total length of the audio
+        chunk_size = min(total_length, int(available_memory // (16 * 1024 * 1024)))  # Rough estimate, 16MB per chunk
+        return chunk_size
 
     def save_experiment_results(self, results, output_structure):
         for key, path in output_structure.items():

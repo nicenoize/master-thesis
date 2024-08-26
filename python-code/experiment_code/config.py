@@ -80,9 +80,9 @@ def save_config(config: ExperimentConfig, config_file: str = "config.yaml"):
     with open(config_file, 'w') as f:
         yaml.dump(config.__dict__, f)
 
-def get_output_structure(config: ExperimentConfig, environment: str, model_type: str, whisper_model: str, gpt_model: str) -> Dict[str, str]:
+def get_output_structure(config: ExperimentConfig, environment: str, model_type: str, whisper_model: str, gpt_model: str, bitrate: int) -> Dict[str, str]:
     base_dir = os.path.join(config.OUTPUT_DIR, environment, model_type)
-    model_dir = f"{whisper_model}_{gpt_model}"
+    model_dir = f"{whisper_model}_{gpt_model}_{bitrate}bps"
     return {
         "transcription": os.path.join(base_dir, model_dir, "transcription"),
         "translation": os.path.join(base_dir, model_dir, "translation"),

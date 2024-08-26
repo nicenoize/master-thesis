@@ -7,6 +7,34 @@ from utils.logger import setup_logger
 from utils.performance_logger import PerformanceLogger
 from utils.model_optimizer import optimize_model
 import gc
+import sys
+
+# import torch
+# import pyannote.audio
+# import transformers
+
+# print(f"PyTorch version: {torch.__version__}")
+# print(f"pyannote.audio version: {pyannote.audio.__version__}")
+# print(f"transformers version: {transformers.__version__}")
+
+def check_versions():
+    try:
+        import torch
+        import torchvision
+        import transformers
+        import pyannote.audio
+
+        print(f"Python version: {sys.version}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"torchvision version: {torchvision.__version__}")
+        print(f"Transformers version: {transformers.__version__}")
+        print(f"pyannote.audio version: {pyannote.audio.__version__}")
+    except ImportError as e:
+        print(f"Error importing a required package: {e}")
+        print("Please make sure all required packages are installed.")
+        sys.exit(1)
+
+check_versions()
 
 logger = setup_logger()
 performance_logger = PerformanceLogger()
