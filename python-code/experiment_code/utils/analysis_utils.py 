@@ -1,0 +1,58 @@
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.meteor_score import meteor_score
+import nltk
+
+nltk.download('wordnet')
+
+def calculate_consistency(transcriptions):
+    vectorizer = TfidfVectorizer()
+    tfidf_matrix = vectorizer.fit_transform(transcriptions)
+    cosine_similarities = cosine_similarity(tfidf_matrix)
+    return np.mean(cosine_similarities)
+
+def calculate_sentiment_agreement(sentiment_results):
+    labels = [result['label'] for result in sentiment_results]
+    return len(set(labels)) / len(labels)
+
+def evaluate_translations(results, reference_translations=None):
+    if reference_translations is None:
+        return None
+    
+    bleu_scores = []
+    meteor_scores = []
+    
+    for result in results.values():
+        for lang, translation in result['translations'].items():
+            reference = reference_translations[lang]
+            bleu_scores.append(sentence_bleu([reference.split()], translation.split()))
+            meteor_scores.append(meteor_score([reference.split()], translation.split()))
+    
+    return {
+        "bleu": np.mean(bleu_scores),
+        "meteor": np.mean(meteor_scores)
+    }
+
+def analyze_audio_features(audio_features):
+    pitch_mean = np.mean([feature['pitch'] for feature in audio_features])
+    pitch_std = np.std([feature['pitch'] for feature in audio_features])
+    intensity_mean = np.mean([feature['intensity'] for feature in audio_features])
+    intensity_std = np.std([feature['intensity'] for feature in audio_features])
+    speech_rate_mean = np.mean([feature['speech_rate'] for feature in audio_features])
+    
+    return {
+        "pitch": {"mean": pitch_mean, "std": pitch_std},
+        "intensity": {"mean": intensity_mean, "std": intensity_std},
+        "speech_rate": speech_rate_mean
+    }
+
+def analyze_video_emotions(video_emotions):
+    emotion_means = {emotion: np.mean([frame[emotion] for frame in video_emotions]) for emotion in video_emotions[0]}
+    dominant_emotion = max(emotion_means, key=emotion_means.get)
+    
+    return {
+        "emotion_means": emotion_means,
+        "dominant_emotion": dominant_emotion
+    }
