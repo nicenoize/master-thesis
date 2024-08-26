@@ -5,6 +5,7 @@ import numpy as np
 from scipy.signal import butter, lfilter
 from api.openai_api import OpenAIAPI
 from api.speechmatics_api import SpeechmaticsAPI
+import gc
 
 class AudioProcessor:
     def __init__(self, config, api_choice=None):
@@ -14,15 +15,18 @@ class AudioProcessor:
         self.speechmatics_api = SpeechmaticsAPI(config.SPEECHMATICS_API_KEY)
         
     async def api_transcribe(self, audio):
+        openai_result = None
+        speechmatics_result = None
+
         if self.api_choice == "1" or self.api_choice == "3":
             openai_result = await self.openai_api.transcribe(audio)
-        else:
-            openai_result = None
-
+        
         if self.api_choice == "2" or self.api_choice == "3":
             speechmatics_result = await self.speechmatics_api.transcribe(audio)
-        else:
-            speechmatics_result = None
+
+        # Clear the audio data and collect garbage
+        audio = None
+        gc.collect()
 
         return {
             "openai": openai_result,

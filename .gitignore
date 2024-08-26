@@ -8,3 +8,5 @@ python-code/output/
 .DS_Store
 
 *.pyc
+
+python-code/experiment_code/experiment_results/

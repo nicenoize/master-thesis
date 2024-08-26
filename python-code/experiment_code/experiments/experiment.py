@@ -18,6 +18,7 @@ import numpy as np
 from moviepy.editor import VideoFileClip
 import gc
 import multiprocessing
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -47,102 +48,129 @@ class Experiment:
         audio_path = video_path.rsplit('.', 1)[0] + '_audio.wav'
         video.audio.write_audiofile(audio_path, codec='pcm_s16le', fps=16000)
         video.close()
+        del video  # Explicitly delete video object
+        gc.collect()  # Force garbage collection
         return audio_path
 
-    async def run(self):
-        whisper_models = self.config.WHISPER_MODELS if self.use_local_models else [self.config.OPENAI_WHISPER_MODEL]
-        gpt_models = ["local"] if self.use_local_models else self.config.GPT_MODELS
+async def run(self):
+    whisper_models = self.config.WHISPER_MODELS if self.use_local_models else [self.config.OPENAI_WHISPER_MODEL]
+    gpt_models = ["local"] if self.use_local_models else self.config.GPT_MODELS
+    original_bitrate = self.get_audio_bitrate(self.input_source)
+    bitrates = [original_bitrate, 8000, 4000]  # Define bitrates lower than the original
 
-        tasks = []
-        for whisper_model in whisper_models:
-            for gpt_model in gpt_models:
-                tasks.append(self.process_video(whisper_model, gpt_model))
+    results = []
+    for bitrate in bitrates:
+        if bitrate <= original_bitrate:
+            audio_path = self.convert_audio_bitrate(self.input_source, bitrate)
+            for whisper_model in whisper_models:
+                for gpt_model in gpt_models:
+                    # Process each model and bitrate sequentially
+                    result = await self.process_video(whisper_model, gpt_model, audio_path, bitrate)
+                    if result is not None:
+                        self.results[f"{whisper_model}_{gpt_model}_{bitrate}"] = result
+                        results.append(result)
+            
+            # Clean up the converted audio file to save space
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+    
+    self.save_results()
+    self.generate_performance_report()
+    generate_plots(self.results, self.environment, self.use_local_models)
+    self.perform_cross_model_analysis()
 
-        results = await asyncio.gather(*tasks)
-        for result in results:
-            self.results[f"{result['whisper_model']}_{result['gpt_model']}"] = result
+    return self.results
 
-        self.save_results()
-        self.generate_performance_report()
-        generate_plots(self.results, self.environment, self.use_local_models)
-        self.perform_cross_model_analysis()
+def get_audio_bitrate(self, video_path):
+    # Use ffprobe or similar tool to get the original bitrate of the audio
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", 
+        "stream=bit_rate", "-of", "default=noprint_wrappers=1:nokey=1", video_path
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    bitrate = int(result.stdout.decode('utf-8').strip())
+    return bitrate
 
-        return self.results
+def convert_audio_bitrate(self, video_path, bitrate):
+    # Convert the audio from the video to the specified lower bitrate
+    audio_path = video_path.rsplit('.', 1)[0] + f'_{bitrate}.wav'
+    subprocess.run([
+        "ffmpeg", "-i", video_path, "-b:a", str(bitrate), "-ar", "16000", "-ac", "1", audio_path,
+        "-y",  # Overwrite without asking
+    ], check=True)
+    return audio_path
 
-    async def process_video(self, whisper_model, gpt_model):
-        output_structure = get_output_structure(
-            self.config,
-            self.environment, 
-            "local" if self.use_local_models else "api",
-            whisper_model,
-            gpt_model
-        )
-        
-        with self.performance_logger.measure_time(f"total_{whisper_model}_{gpt_model}"):
-            video_path = self.input_source
-            audio_path = self.extract_audio_from_video(video_path)
-
+async def process_video(self, whisper_model, gpt_model, audio_path, bitrate):
+    output_structure = get_output_structure(
+        self.config,
+        self.environment, 
+        "local" if self.use_local_models else "api",
+        whisper_model,
+        gpt_model,
+        bitrate
+    )
+    
+    with self.performance_logger.measure_time(f"total_{whisper_model}_{gpt_model}_{bitrate}"):
+        try:
+            # Attempt to read the audio file
             try:
                 audio, sampling_rate = sf.read(audio_path)
                 audio = audio.astype(np.float32)
             except Exception as sf_error:
-                logger.warning(f"Failed to load audio with soundfile: {sf_error}. Trying librosa.")
+                logger.warning(f"SoundFile failed to read the audio: {sf_error}. Trying with librosa.")
                 try:
                     audio, sampling_rate = librosa.load(audio_path, sr=None)
                 except Exception as librosa_error:
-                    logger.error(f"Failed to load audio with librosa: {librosa_error}")
+                    logger.error(f"Librosa failed to read the audio: {librosa_error}")
                     return None
 
-            if sampling_rate != 16000:
-                audio = librosa.resample(audio, orig_sr=sampling_rate, target_sr=16000)
-                sampling_rate = 16000
-            
-            with self.performance_logger.measure_time(f"transcription_{whisper_model}"):
-                if self.use_local_models:
-                    try:
-                        whisper = WhisperModel(whisper_model)
-                        transcription = await whisper.transcribe(audio, language='en')
-                    except Exception as e:
-                        logger.error(f"Error during Whisper model initialization or transcription: {e}")
-                        return None
-                else:
-                    transcription = await self.audio_processor.api_transcribe(audio)
-            
-            with self.performance_logger.measure_time(f"translation_{gpt_model}"):
+            transcription = []
+            chunk_size = 16000 * 2  # 2-second chunks at 16kHz
+            for i in range(0, len(audio), chunk_size):
+                audio_chunk = audio[i:i + chunk_size]
+                with self.performance_logger.measure_time(f"transcription_{whisper_model}_{bitrate}"):
+                    if self.use_local_models:
+                        try:
+                            whisper = WhisperModel(whisper_model)
+                            transcription_chunk = await whisper.transcribe(audio_chunk, language='en')
+                        except Exception as e:
+                            logger.error(f"Error during Whisper model transcription: {e}")
+                            continue
+                    else:
+                        transcription_chunk = await self.audio_processor.api_transcribe(audio_chunk)
+                    
+                    transcription.append(transcription_chunk)
+
+            transcription = " ".join(transcription)
+
+            with self.performance_logger.measure_time(f"translation_{gpt_model}_{bitrate}"):
                 translations = await self.text_processor.translate(transcription, self.use_local_models)
             
             results = {
                 "whisper_model": whisper_model,
                 "gpt_model": gpt_model,
+                "bitrate": bitrate,
                 "transcription": transcription,
                 "translations": translations,
             }
 
-            if self.perform_additional_analysis:
-                with self.performance_logger.measure_time(f"sentiment_analysis_{gpt_model}"):
-                    results["sentiment_analysis"] = await self.text_processor.analyze_sentiment(transcription, self.use_local_models)
-                
-                with self.performance_logger.measure_time("video_analysis"):
-                    results["video_analysis"] = await self.video_processor.analyze_emotions(self.input_source)
-                
-                with self.performance_logger.measure_time("audio_analysis"):
-                    results["audio_analysis"] = await self.audio_processor.extract_speech_features(audio)
-                
-                with self.performance_logger.measure_time("text_analysis"):
-                    results["text_analysis"] = {
-                        "keywords": self.text_processor.extract_keywords(transcription),
-                        "readability": self.text_processor.calculate_readability(transcription)
-                    }
-
-            # Clear variables after use
+            # Clear variables and force garbage collection
             transcription = None
             translations = None
-            gc.collect()  # Force garbage collection
+            audio = None
+            gc.collect()
 
             self.save_experiment_results(results, output_structure)
-            os.remove(audio_path)
 
-        return results
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error during audio conversion: {e}")
+            return None
+
+        except Exception as e:
+            logger.error(f"An error occurred during video processing: {e}")
+            return None
+
+    return results
+
 
     def save_experiment_results(self, results, output_structure):
         for key, path in output_structure.items():

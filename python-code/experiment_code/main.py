@@ -97,6 +97,7 @@ async def main():
         logger.info("Experiment completed")
         performance_logger.generate_report(current_environment, use_local_models)
         performance_logger.plot_performance(current_environment, use_local_models)
+        gc.collect()  # Ensure cleanup after everything is done
 
 if __name__ == "__main__":
     asyncio.run(main())

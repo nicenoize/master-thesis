@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from fer import FER
 import face_recognition
+import gc
 
 class VideoProcessor:
     def __init__(self):
@@ -23,29 +24,23 @@ class VideoProcessor:
                 if emotion:
                     emotions.append(emotion[0]['emotions'])
                     face_locations.append(self.detect_faces(frame))
+                
+                # Clear the frame data to free memory
+                frame = None
+                gc.collect()
 
         video.release()
+        gc.collect()  # Additional garbage collection after video processing
+
         return {
             "duration": duration,
             "emotions": emotions,
             "face_locations": face_locations
         }
 
-    async def analyze_video_frame(self, frame):
-        emotions = self.emotion_detector.detect_emotions(frame)
-        face_locations = self.detect_faces(frame)
-        return {
-            "emotions": emotions[0]['emotions'] if emotions else None,
-            "face_locations": face_locations
-        }
-
     def detect_faces(self, frame):
-        # Convert the image from BGR color (which OpenCV uses) to RGB color (which face_recognition uses)
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Find all the faces in the current frame of video
-        face_locations = face_recognition.face_locations(rgb_frame)
-        
+        # Face detection logic using face_recognition library
+        face_locations = face_recognition.face_locations(frame)
         return face_locations
 
     def extract_facial_landmarks(self, frame):
