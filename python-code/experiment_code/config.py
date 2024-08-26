@@ -25,6 +25,9 @@ class ExperimentConfig:
     LLAMA_MODELS: List[str] = field(default_factory=lambda: ["7B", "13B", "70B"])
     TTS_MODELS: List[str] = field(default_factory=lambda: ["tacotron", "fastspeech"])
 
+    # Default GPT model for API calls
+    DEFAULT_GPT_MODEL: str = "gpt-3.5-turbo"
+
     # Benchmark settings
     TRANSCRIPTION_BENCHMARK_DATASET: str = "path/to/benchmark/dataset"
     TRANSLATION_BENCHMARK_DATASET: str = "path/to/benchmark/dataset"

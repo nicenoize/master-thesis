@@ -1,44 +1,59 @@
-from models.gpt_model import GPTModel
-from models.sentiment_model import SentimentModel
-from api.openai_api import OpenAIAPI
-from config import config
 import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import LatentDirichletAllocation
+from textstat import flesch_reading_ease
+from typing import List, Dict
 
-nltk.download('punkt')
-nltk.download('stopwords')
-nltk.download('wordnet')
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+nltk.download('wordnet', quiet=True)
+
+import logging
+from typing import List, Dict
+from models.gpt_model import GPTModel
+from models.sentiment_model import SentimentModel
+from api.openai_api import OpenAIAPI
+import json
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 class TextProcessor:
-    def __init__(self):
-        self.openai_api = OpenAIAPI(config["OPENAI_API_KEY"])
-        self.stop_words = set(stopwords.words('english'))
-        self.lemmatizer = WordNetLemmatizer()
+    def __init__(self, config):
+        self.config = config
+        self.openai_api = OpenAIAPI(config.OPENAI_API_KEY)
 
-    async def translate(self, text, model):
-        if isinstance(model, GPTModel):
-            return await model.translate(text, config["TARGET_LANGUAGES"])
-        else:
-            translations = {}
-            for lang in config["TARGET_LANGUAGES"]:
-                translations[lang] = await self.openai_api.translate(text, lang, model)
-            return translations
+    async def translate(self, text: str, use_local_models: bool = False) -> Dict[str, str]:
+        translations = {}
+        for lang in self.config.TARGET_LANGUAGES:
+            if use_local_models:
+                # Implement local model translation here
+                translation = f"[Local Translation to {lang}]: {text}"
+            else:
+                logger.debug(f"Calling API translation for language: {lang}")
+                translation = await self.openai_api.translate(text, lang, self.config.DEFAULT_GPT_MODEL)
+            translations[lang] = translation
+        return translations
 
-    async def analyze_sentiment(self, text, model):
-        if isinstance(model, SentimentModel):
-            return await model.analyze(text)
+    async def analyze_sentiment(self, text, use_local_models: bool = False):
+        if use_local_models:
+            # Implement local sentiment analysis here
+            return {"positive": 0.5, "negative": 0.3, "neutral": 0.2}
         else:
-            return await self.openai_api.analyze_sentiment(text, model)
+            logger.debug("Calling API sentiment analysis")
+            sentiment_analysis = await self.openai_api.analyze_sentiment(text, self.config.DEFAULT_GPT_MODEL)
+            return json.loads(sentiment_analysis)
+
 
     async def summarize(self, text, model):
         if isinstance(model, GPTModel):
             return await model.summarize(text)
         else:
-            return await self.openai_api.summarize(text, model)
+            # Implement API-based summarization if needed
+            raise NotImplementedError("API-based summarization not implemented")
 
     def preprocess_text(self, text):
         tokens = word_tokenize(text.lower())
@@ -72,30 +87,11 @@ class TextProcessor:
         return topics
 
     def calculate_readability(self, text):
-        sentences = sent_tokenize(text)
-        words = word_tokenize(text)
-        
-        num_sentences = len(sentences)
-        num_words = len(words)
-        num_syllables = sum(self.count_syllables(word) for word in words)
-        
-        # Calculate Flesch-Kincaid Grade Level
-        fk_grade = 0.39 * (num_words / num_sentences) + 11.8 * (num_syllables / num_words) - 15.59
-        
-        return fk_grade
+        return flesch_reading_ease(text)
 
     def count_syllables(self, word):
-        # This is a simple syllable counter and may not be 100% accurate
-        vowels = 'aeiouy'
-        num_vowels = 0
-        last_was_vowel = False
-        for wc in word.lower():
-            is_vowel = wc in vowels
-            if is_vowel and not last_was_vowel:
-                num_vowels += 1
-            last_was_vowel = is_vowel
-        if word.endswith('e'):
-            num_vowels -= 1
-        if num_vowels == 0:
-            num_vowels = 1
-        return num_vowels
+        return len(
+            ''.join(c for c in word if c in 'aeiouAEIOU')
+                .replace('es$', '')
+                .replace('e$', '')
+        )

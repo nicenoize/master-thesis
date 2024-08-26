@@ -3,17 +3,27 @@ import soundfile as sf
 from pydub import AudioSegment
 import numpy as np
 from scipy.signal import butter, lfilter
-from config import config
 from api.openai_api import OpenAIAPI
+from api.speechmatics_api import SpeechmaticsAPI
 
 class AudioProcessor:
-    def __init__(self, config):
+    def __init__(self, config, api_choice=None):
+        self.config = config
+        self.api_choice = api_choice
         self.openai_api = OpenAIAPI(config.OPENAI_API_KEY)
         self.speechmatics_api = SpeechmaticsAPI(config.SPEECHMATICS_API_KEY)
-
+        
     async def api_transcribe(self, audio):
-        openai_result = await self.openai_api.transcribe(audio)
-        speechmatics_result = await self.speechmatics_api.transcribe(audio)
+        if self.api_choice == "1" or self.api_choice == "3":
+            openai_result = await self.openai_api.transcribe(audio)
+        else:
+            openai_result = None
+
+        if self.api_choice == "2" or self.api_choice == "3":
+            speechmatics_result = await self.speechmatics_api.transcribe(audio)
+        else:
+            speechmatics_result = None
+
         return {
             "openai": openai_result,
             "speechmatics": speechmatics_result
@@ -31,23 +41,29 @@ class AudioProcessor:
         sf.write(audio_path, audio, target_sr)
         return audio_path
 
-    async def extract_speech_features(self, audio_chunk):
-        # Convert pydub AudioSegment to numpy array
-        audio_array = np.array(audio_chunk.get_array_of_samples()).astype(np.float32)
-        sample_rate = audio_chunk.frame_rate
+    async def extract_speech_features(self, audio_input):
+        if isinstance(audio_input, str):
+            # If audio_input is a string, assume it's a file path and load the audio
+            audio, sr = librosa.load(audio_input, sr=None)
+        elif isinstance(audio_input, AudioSegment):
+            # If it's an AudioSegment, convert it to a numpy array
+            audio = np.array(audio_input.get_array_of_samples()).astype(np.float32)
+            sr = audio_input.frame_rate
+        else:
+            raise ValueError("Invalid audio input type. Expected string (file path) or AudioSegment.")
 
         # Extract pitch
-        pitches, magnitudes = librosa.piptrack(y=audio_array, sr=sample_rate)
+        pitches, magnitudes = librosa.piptrack(y=audio, sr=sr)
         pitch = np.mean(pitches[magnitudes > np.max(magnitudes) * 0.7])
 
         # Extract intensity (volume)
-        intensity = librosa.feature.rms(y=audio_array)[0]
+        intensity = librosa.feature.rms(y=audio)[0]
 
         # Extract speech rate (syllables per second)
-        speech_rate = self.estimate_speech_rate(audio_array, sample_rate)
+        speech_rate = self.estimate_speech_rate(audio, sr)
 
         # Extract formants
-        formants = self.extract_formants(audio_array, sample_rate)
+        formants = self.extract_formants(audio, sr)
 
         return {
             "pitch": pitch,
@@ -55,6 +71,7 @@ class AudioProcessor:
             "speech_rate": speech_rate,
             "formants": formants
         }
+
 
     def estimate_speech_rate(self, audio, sr):
         onset_env = librosa.onset.onset_strength(y=audio, sr=sr)

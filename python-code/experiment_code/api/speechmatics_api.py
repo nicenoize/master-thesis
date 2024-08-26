@@ -1,19 +1,21 @@
-from openai import AsyncOpenAI
+# TODO! Implement this
 import api.rateLimiter as rateLimiter
+import aiohttp
 
 class SpeechmaticsAPI:
     def __init__(self, api_key):
-        self.client = AsyncOpenAI(api_key=api_key)
+        self.api_key = api_key
+        self.base_url = "https://asr.api.speechmatics.com/v2"
 
     async def transcribe(self, audio_file):
-        with open(audio_file, "rb") as audio_file:
-            response = await rateLimiter.api_call_with_backoff_whisper(
-                self.client.audio.transcriptions.create,
-                model="whisper-1",
-                file=audio_file,
-                response_format="text"
-            )
-        return response
+        # Implement the Speechmatics API call here
+        # This is a placeholder implementation
+        async with aiohttp.ClientSession() as session:
+            # You'll need to implement the actual API call here
+            # using the Speechmatics API documentation
+            pass
+
+        return "Speechmatics transcription result"
 
     async def translate(self, text, target_language, model):
         response = await rateLimiter.api_call_with_backoff(
