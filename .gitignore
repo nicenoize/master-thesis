@@ -6,3 +6,5 @@ media/
 python-code/output/
 
 .DS_Store
+
+*.pyc
