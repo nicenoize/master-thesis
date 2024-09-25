@@ -31,7 +31,7 @@ async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
     if transcribed_text:
         logger.info(f"Transcribed text: {transcribed_text[:100]}...")
         audio_features = await analyze_audio_features(audio_chunk)
-        logger.info(f"Audio features extracted: {audio_features}")
+        # logger.info(f"Audio features extracted: {audio_features}")
         video_emotions = (
             await analyze_video_frame(video_frame) if video_frame is not None else None
         )
