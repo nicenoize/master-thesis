@@ -10,6 +10,7 @@ from scipy import stats
 import config  # Import the entire config module
 from classes import Conversation
 
+
 conversation = Conversation()
 logger = config.logger  # Use logger from config
 
@@ -66,7 +67,7 @@ def generate_performance_plots():
     import numpy as np
 
     environments = config.ENVIRONMENTS
-    gpt_models = ["gpt-4", "gpt-4-0613"]
+    gpt_models = ["gpt-4o", "gpt-4-0613"]
     whisper_models = ["base", "small", "medium", "large"]
 
     # Load data for all environments

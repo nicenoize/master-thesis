@@ -24,10 +24,10 @@ from utils import validate_file_path, save_current_state
 conversation = Conversation()
 logger = config.logger
 
-async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
+async def process_chunk(audio_chunk, video_frame=None, use_local_models=False, loop=None):
     start_time = time.time()
     logger.info("Processing a new chunk.")
-    transcribed_text = await transcribe_audio(audio_chunk, use_local_models)
+    transcribed_text = await transcribe_audio(audio_chunk, use_local_models, loop)
     if transcribed_text:
         logger.info(f"Transcribed text: {transcribed_text[:100]}...")
         audio_features = await analyze_audio_features(audio_chunk)
@@ -37,14 +37,14 @@ async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
         )
         logger.info(f"Video emotions: {video_emotions}")
         detailed_analysis_result = await detailed_analysis(
-            transcribed_text, audio_features, video_emotions, use_local_models
+            transcribed_text, audio_features, video_emotions, use_local_models, loop
         )
         logger.info(f"Detailed analysis: {detailed_analysis_result}")
         conversation.add_text(detailed_analysis_result)
 
         # Translate concurrently
         translation_tasks = [
-            translate_text(detailed_analysis_result, lang, use_local_models)
+            translate_text(detailed_analysis_result, lang, use_local_models, loop)
             for lang in config.TARGET_LANGUAGES
         ]
         translations = await asyncio.gather(*translation_tasks)
@@ -63,7 +63,7 @@ async def process_chunk(audio_chunk, video_frame=None, use_local_models=False):
         [],
     ).append(total_time)
 
-async def process_video_file(file_path, use_local_models=False):
+async def process_video_file(file_path, use_local_models=False, loop=None):
     logger.info(f"Processing video file: {file_path}")
     video = cv2.VideoCapture(file_path)
     fps = video.get(cv2.CAP_PROP_FPS)
@@ -91,10 +91,10 @@ async def process_video_file(file_path, use_local_models=False):
             ret, frame = video.read()
 
             if ret:
-                await process_chunk(chunk, frame, use_local_models)
+                await process_chunk(chunk, frame, use_local_models, loop)
             else:
                 logger.warning(f"Could not read frame at time {timestamp:.2f} seconds")
-                await process_chunk(chunk, use_local_models=use_local_models)
+                await process_chunk(chunk, use_local_models=use_local_models, loop=loop)
 
     tasks = [process_chunk_wrapper(i, chunk) for i, chunk in enumerate(audio_chunks)]
     await asyncio.gather(*tasks)
@@ -102,7 +102,17 @@ async def process_video_file(file_path, use_local_models=False):
     logger.info("Finished processing video file")
     video.release()
 
-async def run_experiment(input_source, use_local_models=False):
+async def capture_and_process_stream(stream_url, use_local_models=False, loop=None):
+    producer = asyncio.create_task(chunk_producer(stream_url))
+    consumers = [asyncio.create_task(chunk_consumer(use_local_models, loop)) for _ in range(2)]  # Reduced from 5 to 2, can be increased later
+    
+    await producer
+    await chunk_queue.join()
+    for consumer in consumers:
+        consumer.cancel()
+    await asyncio.gather(*consumers, return_exceptions=True)
+
+async def run_experiment(input_source, use_local_models=False, loop=None):
     gpt_models = ["gpt-4", "gpt-4-0613"]
     whisper_models = ["base", "small", "medium", "large"]
 
@@ -117,9 +127,9 @@ async def run_experiment(input_source, use_local_models=False):
                 )
 
                 if isinstance(input_source, str) and input_source.startswith("rtmp://"):
-                    await capture_and_process_stream(input_source, use_local_models)
+                    await capture_and_process_stream(input_source, use_local_models, loop)
                 else:
-                    await process_video_file(input_source, use_local_models)
+                    await process_video_file(input_source, use_local_models, loop)
 
                 logger.info(
                     f"Finished experiment with GPT model: {gpt_model}, Whisper model: {whisper_model}"
@@ -132,7 +142,7 @@ async def run_experiment(input_source, use_local_models=False):
         save_current_state()
 
         if conversation.original_text.strip():
-            summary = await summarize_text(conversation.original_text, use_local_models)
+            summary = await summarize_text(conversation.original_text, use_local_models, loop)
             if summary:
                 logger.info(f"Summary: {summary}")
                 with open(
@@ -146,3 +156,4 @@ async def run_experiment(input_source, use_local_models=False):
     except Exception as e:
         logger.error(f"Error during experiment: {e}", exc_info=True)
         save_current_state()
+
