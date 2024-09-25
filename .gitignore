@@ -6,3 +6,11 @@ media/
 python-code/output/
 
 .DS_Store
+
+/python-code/project_files/output
+
+/python-code/__pycache__/
+
+*.pyc
+
+/python-code/experiment_code/experiment_results/
