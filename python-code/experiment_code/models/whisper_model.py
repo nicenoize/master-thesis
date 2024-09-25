@@ -44,7 +44,7 @@ class WhisperModel:
             logger.error(f"Error initializing models: {e}")
             raise
 
-    def _prepare_audio(self, audio, sampling_rate):
+    def prepare_audio(self, audio, sampling_rate):
         if isinstance(audio, np.ndarray):
             audio = torch.from_numpy(audio).float()
         if audio.dim() == 1:
